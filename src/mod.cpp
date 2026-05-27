@@ -515,187 +515,137 @@ idle:
 
         if (IsKeyJustPressed(VK_F9) && gProcessEventAddr && gBeginSpawnFunc) {
             Log("=== F9: SPAWN ===\n");
-
-            // Refresh object count
             SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
             SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
 
-            // Re-cache any UFunctions that weren't found at startup
-            if (!gSetLocFunc) gSetLocFunc = FindUFunc(L"K2_SetActorLocation", 200, 400);
-            if (!gConstructionFunc) gConstructionFunc = FindUFunc(L"UserConstructionScript", 0, 16);
-            if (!gBeginPlayFunc) gBeginPlayFunc = FindUFunc(L"ReceiveBeginPlay", 0, 16);
-            Log("SetLoc=%s Constr=%s BeginPlay=%s\n",
-                gSetLocFunc?"OK":"NO", gConstructionFunc?"OK":"NO", gBeginPlayFunc?"OK":"NO");
-
-            // Find BP_SanctifiedAnvil_C
-            void* anvilClass = FindClass(L"BP_SanctifiedAnvil_C");
-            Log("AnvilClass: %s\n", anvilClass ? "OK" : "NOT LOADED");
-            if (!anvilClass) { Log("BP_SanctifiedAnvil_C not loaded, cannot spawn\n"); continue; }
-
-            // Find game world
+            // === SINGLE PASS: find everything in one loop ===
+            void* anvilClass = nullptr;
             void* world = nullptr;
-            wchar_t nb[256], cb[256];
-            for (int i = 0; i < gNumElements && !world; i++) {
+            void* freshBS = nullptr, *freshFS = nullptr, *freshSL = nullptr;
+            void* freshCS = nullptr, *freshBP = nullptr, *freshCDO = nullptr;
+            void* ssaFunc = nullptr, *esaFunc = nullptr;
+            void* gmInst = nullptr, *srmInst = nullptr, *gsInst = nullptr, *pscInst = nullptr;
+            void* fabInstances[32] = {}; int fabCount = 0;
+            wchar_t nb[256], cb[256], ob[256];
+
+            for (int i = 0; i < gNumElements; i++) {
                 void* o = GetUObject(i); if (!o) continue;
-                void* c = GetObjClass(o); if (!c) continue;
-                if (!GetObjectName(c, cb, 256) || wcscmp(cb, L"World") != 0) continue;
-                if (!GetObjectName(o, nb, 256) || wcsncmp(nb, L"Default__", 9) == 0) continue;
-                if (wcsstr(nb, L"RogueLite") || wcsstr(nb, L"Mission")) world = o;
-            }
-            Log("World: %s\n", world ? "OK" : "NO");
-            if (!world) continue;
+                if (!GetObjectName(o, nb, 256)) continue;
 
-            // Get player location
-            double px, py, pz;
-            if (!GetPlayerLoc(&px, &py, &pz)) { Log("Player location failed\n"); continue; }
-            Log("Player: (%.0f, %.0f, %.0f)\n", px, py, pz);
-
-            // Spawn 300 units in front of player
-            // Find ALL UFunctions fresh — log every detail for debugging
-            Log("--- Finding UFunctions (detailed) ---\n");
-
-            // Find ALL FinishSpawningActor matches
-            void* freshBeginSpawn = nullptr;
-            void* freshFinishSpawn = nullptr;
-            void* freshSetLoc = nullptr;
-            void* freshConstruction = nullptr;
-            void* freshBeginPlay = nullptr;
-            void* freshCDO = nullptr;
-            {
-                wchar_t nb[256], ob[256];
-                for (int i = 0; i < gNumElements; i++) {
-                    void* o = GetUObject(i); if (!o) continue;
-                    if (!GetObjectName(o, nb, 256)) continue;
-
-                    int32_t ps = 0;
+                // UFunctions (check by name, verify by PropsSize)
+                int32_t ps = 0;
+                if (wcscmp(nb, L"BeginDeferredActorSpawnFromClass") == 0) {
                     SafeRead32((uintptr_t)o + 0x58, &ps);
-                    void* outer = GetObjOuter(o);
-                    if (outer) GetObjectName(outer, ob, 256); else ob[0] = 0;
-
-                    if (wcscmp(nb, L"BeginDeferredActorSpawnFromClass") == 0) {
-                        Log("  BeginDeferred: PS=%d outer='%ls' at 0x%llX\n", ps, ob, (uintptr_t)o);
-                        if (ps >= 100 && ps <= 200 && !freshBeginSpawn) freshBeginSpawn = o;
-                    }
-                    if (wcscmp(nb, L"FinishSpawningActor") == 0) {
-                        Log("  FinishSpawn: PS=%d outer='%ls' at 0x%llX\n", ps, ob, (uintptr_t)o);
-                        if (ps >= 100 && ps <= 200 && !freshFinishSpawn) freshFinishSpawn = o;
-                    }
-                    if (wcscmp(nb, L"K2_SetActorLocation") == 0 && ps >= 200) {
-                        Log("  SetLoc: PS=%d outer='%ls' at 0x%llX\n", ps, ob, (uintptr_t)o);
-                        if (!freshSetLoc) freshSetLoc = o;
-                    }
-                    if (wcscmp(nb, L"UserConstructionScript") == 0) {
-                        Log("  Construction: PS=%d outer='%ls' at 0x%llX\n", ps, ob, (uintptr_t)o);
-                        // Prefer BP_SanctifiedAnvil_C's version over generic
-                        if (wcsstr(ob, L"SanctifiedAnvil")) freshConstruction = o;
-                        else if (ps <= 16 && !freshConstruction) freshConstruction = o;
-                    }
-                    if (wcscmp(nb, L"ReceiveBeginPlay") == 0) {
-                        Log("  BeginPlay: PS=%d outer='%ls' at 0x%llX\n", ps, ob, (uintptr_t)o);
-                        // Prefer BP_SanctifiedAnvil_C's version over generic
-                        if (wcsstr(ob, L"SanctifiedAnvil")) freshBeginPlay = o;
-                        else if (ps <= 16 && !freshBeginPlay) freshBeginPlay = o;
-                    }
-                    if (wcscmp(nb, L"Default__GameplayStatics") == 0) {
-                        Log("  CDO: at 0x%llX\n", (uintptr_t)o);
-                        if (!freshCDO) freshCDO = o;
-                    }
-                    if (wcscmp(nb, L"RerunConstructionScripts") == 0 || wcscmp(nb, L"RegisterAllComponents") == 0) {
-                        Log("  %ls: PS=%d outer='%ls' at 0x%llX\n", nb, ps, ob, (uintptr_t)o);
-                    }
+                    if (ps >= 100 && ps <= 200 && !freshBS) freshBS = o;
                 }
+                else if (wcscmp(nb, L"FinishSpawningActor") == 0) {
+                    SafeRead32((uintptr_t)o + 0x58, &ps);
+                    if (ps >= 100 && ps <= 200 && !freshFS) freshFS = o;
+                }
+                else if (wcscmp(nb, L"K2_SetActorLocation") == 0) {
+                    SafeRead32((uintptr_t)o + 0x58, &ps);
+                    if (ps >= 200 && !freshSL) freshSL = o;
+                }
+                else if (wcscmp(nb, L"UserConstructionScript") == 0) {
+                    SafeRead32((uintptr_t)o + 0x58, &ps);
+                    void* ou = GetObjOuter(o);
+                    if (ou) { GetObjectName(ou, ob, 256); if (wcsstr(ob, L"SanctifiedAnvil")) freshCS = o; }
+                    if (ps <= 16 && !freshCS) freshCS = o;
+                }
+                else if (wcscmp(nb, L"ReceiveBeginPlay") == 0) {
+                    SafeRead32((uintptr_t)o + 0x58, &ps);
+                    void* ou = GetObjOuter(o);
+                    if (ou) { GetObjectName(ou, ob, 256); if (wcsstr(ob, L"SanctifiedAnvil")) freshBP = o; }
+                    if (ps <= 16 && !freshBP) freshBP = o;
+                }
+                else if (wcscmp(nb, L"Default__GameplayStatics") == 0) { if (!freshCDO) freshCDO = o; }
+                else if (wcscmp(nb, L"SetSanctifiedAnvil") == 0) {
+                    SafeRead32((uintptr_t)o + 0x58, &ps);
+                    if (ps >= 4 && ps <= 16 && !ssaFunc) ssaFunc = o;
+                }
+                else if (wcscmp(nb, L"EnableSanctifiedAnvil") == 0) {
+                    SafeRead32((uintptr_t)o + 0x58, &ps);
+                    if (ps >= 100 && !esaFunc) esaFunc = o;
+                }
+
+                // Skip CDOs for instance searches
+                if (wcsncmp(nb, L"Default__", 9) == 0) continue;
+
+                // Classes and instances (check class name)
+                void* c = GetObjClass(o); if (!c) continue;
+                if (!GetObjectName(c, cb, 256)) continue;
+
+                if (!anvilClass && (wcscmp(cb, L"BlueprintGeneratedClass") == 0 || wcscmp(cb, L"Class") == 0)
+                    && wcscmp(nb, L"BP_SanctifiedAnvil_C") == 0) anvilClass = o;
+
+                if (!world && wcscmp(cb, L"World") == 0 && (wcsstr(nb, L"RogueLite") || wcsstr(nb, L"Mission")))
+                    world = o;
+
+                if (wcscmp(cb, L"BP_Fabricator_C") == 0 && fabCount < 32)
+                    fabInstances[fabCount++] = o;
+
+                if (!gmInst && wcsstr(cb, L"GameMode") && (wcsstr(cb, L"Dungeon") || wcsstr(cb, L"RogueLite")))
+                    gmInst = o;
+                if (!srmInst && wcsstr(cb, L"EncounterManager") && wcsstr(cb, L"SafeRoom"))
+                    srmInst = o;
+                if (!gsInst && wcsstr(cb, L"GameState") && wcsstr(cb, L"RogueLite"))
+                    gsInst = o;
+                if (!pscInst && wcsstr(cb, L"ValPlayerSanctifyComponent") && !wcsstr(nb, L"GEN_VARIABLE"))
+                    pscInst = o;
             }
 
-            // Find ProcessEvent
+            // ProcessEvent from CDO vtable
             uintptr_t freshPE = 0;
             if (freshCDO) {
                 uintptr_t vt = 0; SafeRead64((uintptr_t)freshCDO, &vt);
-                if (vt) {
-                    uintptr_t fa = 0; SafeRead64(vt + PROCESS_EVENT_VTABLE_SLOT * 8, &fa);
-                    if (fa >= gTextStart && fa < gTextStart + gTextSize) freshPE = fa;
-                }
-                Log("  PE: 0x%llX\n", freshPE);
+                if (vt) { uintptr_t fa = 0; SafeRead64(vt + PROCESS_EVENT_VTABLE_SLOT * 8, &fa);
+                    if (fa >= gTextStart && fa < gTextStart + gTextSize) freshPE = fa; }
             }
 
-            Log("Selected: BS=0x%llX FS=0x%llX SL=0x%llX CS=0x%llX BP=0x%llX CDO=0x%llX PE=0x%llX\n",
-                (uintptr_t)freshBeginSpawn, (uintptr_t)freshFinishSpawn, (uintptr_t)freshSetLoc,
-                (uintptr_t)freshConstruction, (uintptr_t)freshBeginPlay, (uintptr_t)freshCDO, freshPE);
+            Log("Anvil=%s World=%s BS=%s FS=%s PE=%s Fabs=%d\n",
+                anvilClass?"OK":"NO", world?"OK":"NO", freshBS?"OK":"NO", freshFS?"OK":"NO",
+                freshPE?"OK":"NO", fabCount);
 
-            if (!freshBeginSpawn || !freshFinishSpawn || !freshCDO || !freshPE) {
-                Log("Missing critical functions, cannot spawn\n");
-                continue;
+            if (!anvilClass || !world || !freshBS || !freshFS || !freshCDO || !freshPE) {
+                Log("Missing critical objects\n"); continue;
             }
 
-            gSpawnReq.bpAnvilClass = anvilClass;
-            gSpawnReq.gameWorld = world;
-            gSpawnReq.spawnFunc = freshBeginSpawn;
-            gSpawnReq.finishSpawnFunc = freshFinishSpawn;
-            gSpawnReq.gameplayStaticsCDO = freshCDO;
-            gSpawnReq.processEventAddr = freshPE;
-            gSpawnReq.setLocFunc = freshSetLoc;
-            gSpawnReq.constructionFunc = freshConstruction;
-            gSpawnReq.beginPlayFunc = freshBeginPlay;
-            gSpawnReq.rerunConstructionFunc = FindUFunc(L"RerunConstructionScripts", 0, 16);
-            // Find ALL fabricators and create spawn positions for each
+            // Get fabricator positions via ProcessEvent (fast — only fabCount calls)
             int sc = 0;
-            {
-                wchar_t cb2[256];
-                for (int i = 0; i < gNumElements && sc < 32; i++) {
-                    void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
-                    void* c = GetObjClass(o); if (!c) continue;
-                    if (!GetObjectName(c, cb2, 256) || wcscmp(cb2, L"BP_Fabricator_C") != 0) continue;
-                    double fx, fy, fz;
-                    if (GetActorLoc(o, &fx, &fy, &fz)) {
-                        gSpawnReq.spawnX[sc] = fx + (-576.8);
-                        gSpawnReq.spawnY[sc] = fy + 35.5;
-                        gSpawnReq.spawnZ[sc] = fz + (-123.1);
-                        Log("  Fab %d at (%.0f, %.0f, %.0f) -> Anvil at (%.0f, %.0f, %.0f)\n",
-                            sc, fx, fy, fz, gSpawnReq.spawnX[sc], gSpawnReq.spawnY[sc], gSpawnReq.spawnZ[sc]);
-                        sc++;
-                    }
+            for (int fi = 0; fi < fabCount && sc < 32; fi++) {
+                double fx, fy, fz;
+                if (GetActorLoc(fabInstances[fi], &fx, &fy, &fz)) {
+                    gSpawnReq.spawnX[sc] = fx - 576.8;
+                    gSpawnReq.spawnY[sc] = fy + 35.5;
+                    gSpawnReq.spawnZ[sc] = fz - 123.1;
+                    sc++;
                 }
             }
             if (sc == 0) {
-                // Fallback: spawn near player
-                gSpawnReq.spawnX[0] = px + 300;
-                gSpawnReq.spawnY[0] = py;
-                gSpawnReq.spawnZ[0] = pz;
-                sc = 1;
-                Log("No fabricators found, spawning near player\n");
+                double px, py, pz;
+                if (GetPlayerLoc(&px, &py, &pz)) {
+                    gSpawnReq.spawnX[0] = px + 300; gSpawnReq.spawnY[0] = py; gSpawnReq.spawnZ[0] = pz; sc = 1;
+                }
             }
             gSpawnReq.spawnCount = sc;
 
-            // Single-pass: find GameMode, SafeRoomMgr, GameState, PlayerSanctifyComp
-            void* ssaFunc = FindUFunc(L"SetSanctifiedAnvil", 4, 16);
-            void* enableSAFunc = FindUFunc(L"EnableSanctifiedAnvil", 100, 200);
-            void* gmInst = nullptr, *safeRoomMgr = nullptr, *gsInst = nullptr, *pscInst = nullptr;
-            {
-                wchar_t cbn[256], obn[256];
-                for (int i = 0; i < gNumElements; i++) {
-                    void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
-                    void* c = GetObjClass(o); if (!c) continue;
-                    if (!GetObjectName(c, cbn, 256)) continue;
-                    if (!gmInst && wcsstr(cbn, L"GameMode") && (wcsstr(cbn, L"Dungeon") || wcsstr(cbn, L"RogueLite")))
-                        gmInst = o;
-                    if (!safeRoomMgr && wcsstr(cbn, L"EncounterManager") && wcsstr(cbn, L"SafeRoom"))
-                        safeRoomMgr = o;
-                    if (!gsInst && wcsstr(cbn, L"GameState") && wcsstr(cbn, L"RogueLite"))
-                        gsInst = o;
-                    if (!pscInst && wcsstr(cbn, L"ValPlayerSanctifyComponent")) {
-                        GetObjectName(o, obn, 256);
-                        if (!wcsstr(obn, L"GEN_VARIABLE")) pscInst = o;
-                    }
-                }
-            }
+            // Set all spawn request fields
+            gSpawnReq.bpAnvilClass = anvilClass;
+            gSpawnReq.gameWorld = world;
+            gSpawnReq.spawnFunc = freshBS;
+            gSpawnReq.finishSpawnFunc = freshFS;
+            gSpawnReq.gameplayStaticsCDO = freshCDO;
+            gSpawnReq.processEventAddr = freshPE;
+            gSpawnReq.setLocFunc = freshSL;
+            gSpawnReq.constructionFunc = freshCS;
+            gSpawnReq.beginPlayFunc = freshBP;
+            gSpawnReq.rerunConstructionFunc = nullptr;
             gSpawnReq.setSanctifiedAnvilFunc = ssaFunc;
             gSpawnReq.gameModeInstance = gmInst;
-            gSpawnReq.enableSAFunc = enableSAFunc;
-            gSpawnReq.safeRoomMgr = safeRoomMgr;
+            gSpawnReq.enableSAFunc = esaFunc;
+            gSpawnReq.safeRoomMgr = srmInst;
             gSpawnReq.gameStateInst = gsInst;
             gSpawnReq.playerSanctifyComp = pscInst;
-            Log("GM=%s SRM=%s GS=%s PSC=%s SSA=%s ESA=%s\n",
-                gmInst?"OK":"NO", safeRoomMgr?"OK":"NO", gsInst?"OK":"NO",
-                pscInst?"OK":"NO", ssaFunc?"OK":"NO", enableSAFunc?"OK":"NO");
 
             Log("Spawning %d anvils...\n", sc);
             gSpawnReq.resultReady = false;

@@ -194,6 +194,38 @@ static void GameThreadSpawn() {
         SpawnOneAnvil(pe, gSpawnReq.spawnX[i], gSpawnReq.spawnY[i], gSpawnReq.spawnZ[i]);
     }
 
+    // Check if GetSanctifyingAvailable is now TRUE
+    void* gsAvailFunc = nullptr;
+    void* gameStateInst = nullptr;
+    {
+        wchar_t nb2[256], cb2[256];
+        for (int i = 0; i < gNumElements; i++) {
+            void* o = GetUObject(i); if (!o) continue;
+            if (!GetObjectName(o, nb2, 256)) continue;
+            if (wcscmp(nb2, L"GetSanctifyingAvailable") == 0) {
+                int32_t ps2 = 0; SafeRead32((uintptr_t)o + 0x58, &ps2);
+                if (ps2 <= 8) { gsAvailFunc = o; }
+            }
+        }
+        for (int i = 0; i < gNumElements && !gameStateInst; i++) {
+            void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
+            void* c = GetObjClass(o); if (!c) continue;
+            if (!GetObjectName(c, cb2, 256)) continue;
+            if (wcsstr(cb2, L"GameState") && wcsstr(cb2, L"RogueLite")) {
+                gameStateInst = o;
+            }
+        }
+    }
+    if (gsAvailFunc && gameStateInst) {
+        __declspec(align(16)) uint8_t gp[64] = {};
+        __try {
+            pe(gameStateInst, gsAvailFunc, gp);
+            Log("[GT] GetSanctifyingAvailable = %s\n", gp[0] ? "TRUE" : "FALSE");
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            Log("[GT] GetSanctifyingAvailable crashed\n");
+        }
+    }
+
     Log("[GT] *** %d ANVILS SPAWNED! ***\n", gSpawnReq.spawnCount);
     gSpawnReq.success = true;
     gSpawnReq.resultReady = true;

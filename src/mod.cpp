@@ -697,21 +697,94 @@ idle:
 
         if (IsKeyJustPressed(VK_F8) && gObjArrayBase && gFNameToString) {
             SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
-            Log("\n=== F8: SCAN (%d objects) ===\n", gNumElements);
+            SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
+            Log("\n=== F8: SANCTIFY DIAGNOSTICS (%d objects) ===\n", gNumElements);
             wchar_t nb[256], cb[256];
-            const wchar_t* terms[] = {L"Sanctif", L"Fabricat", L"Forge", nullptr};
-            for (int t = 0; terms[t]; t++) {
-                Log("%ls:\n", terms[t]);
+
+            // Find all sanctify-related INSTANCES (not classes/functions)
+            Log("--- Live Sanctify Instances ---\n");
+            const wchar_t* sanctifyClasses[] = {
+                L"SanctifiedAnvil", L"SanctifyComponent", L"SanctifyConfig",
+                L"ValSanctifiedAnvil", L"BP_SanctifiedAnvil", nullptr
+            };
+            for (int sc = 0; sanctifyClasses[sc]; sc++) {
                 int found = 0;
                 for (int i = 0; i < gNumElements && found < 10; i++) {
                     void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
-                    if (!GetObjectName(o, nb, 256) || !wcsstr(nb, terms[t])) continue;
-                    void* c = GetObjClass(o);
-                    GetObjectName(c, cb, 256);
-                    Log("  '%ls' (class '%ls')\n", nb, cb);
+                    void* c = GetObjClass(o); if (!c) continue;
+                    if (!GetObjectName(c, cb, 256) || !wcsstr(cb, sanctifyClasses[sc])) continue;
+                    GetObjectName(o, nb, 256);
+                    Log("  '%ls' (class '%ls') at 0x%llX\n", nb, cb, (uintptr_t)o);
+                    // Get location if possible
+                    if (gProcessEventAddr && gGetLocFunc) {
+                        double ax, ay, az;
+                        if (GetActorLoc(o, &ax, &ay, &az))
+                            Log("    Location: (%.1f, %.1f, %.1f)\n", ax, ay, az);
+                    }
                     found++;
                 }
-                if (!found) Log("  (none)\n");
+            }
+
+            // Find the player's sanctify component specifically
+            Log("\n--- Player Sanctify Component ---\n");
+            for (int i = 0; i < gNumElements; i++) {
+                void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
+                void* c = GetObjClass(o); if (!c) continue;
+                if (!GetObjectName(c, cb, 256)) continue;
+                if (wcsstr(cb, L"PlayerSanctify") || wcsstr(cb, L"SanctifyComponent")) {
+                    GetObjectName(o, nb, 256);
+                    void* outer = GetObjOuter(o);
+                    wchar_t outerName[256] = {};
+                    if (outer) GetObjectName(outer, outerName, 256);
+                    Log("  '%ls' (class '%ls') outer='%ls'\n", nb, cb, outerName);
+                }
+            }
+
+            // Check what the game mode knows about the anvil
+            Log("\n--- GameMode State ---\n");
+            for (int i = 0; i < gNumElements; i++) {
+                void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
+                void* c = GetObjClass(o); if (!c) continue;
+                if (!GetObjectName(c, cb, 256) || !wcsstr(cb, L"GameMode")) continue;
+                if (!wcsstr(cb, L"RogueLite") && !wcsstr(cb, L"Dungeon")) continue;
+                GetObjectName(o, nb, 256);
+                Log("  '%ls' (class '%ls')\n", nb, cb);
+                // Try calling IsInForge on it
+                void* isInForgeFunc = FindUFunc(L"IsInForge", 0, 8);
+                if (isInForgeFunc && gProcessEventAddr) {
+                    __declspec(align(16)) uint8_t ifp[64] = {};
+                    __try {
+                        ((ProcessEvent_fn)gProcessEventAddr)(o, isInForgeFunc, ifp);
+                        bool result = *(bool*)(ifp + 0);
+                        Log("    IsInForge() = %s\n", result ? "TRUE" : "FALSE");
+                    } __except(EXCEPTION_EXECUTE_HANDLER) {
+                        Log("    IsInForge() crashed\n");
+                    }
+                }
+                // Try GetSanctifyingAvailable on game state
+                break;
+            }
+
+            // Check GetSanctifyingAvailable on game state
+            Log("\n--- GameState Sanctify ---\n");
+            void* getSanctAvail = FindUFunc(L"GetSanctifyingAvailable", 0, 8);
+            if (getSanctAvail) {
+                for (int i = 0; i < gNumElements; i++) {
+                    void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
+                    void* c = GetObjClass(o); if (!c) continue;
+                    if (!GetObjectName(c, cb, 256) || !wcsstr(cb, L"GameState")) continue;
+                    if (!wcsstr(cb, L"Dungeon") && !wcsstr(cb, L"RogueLite")) continue;
+                    GetObjectName(o, nb, 256);
+                    __declspec(align(16)) uint8_t gsp[64] = {};
+                    __try {
+                        ((ProcessEvent_fn)gProcessEventAddr)(o, getSanctAvail, gsp);
+                        bool avail = *(bool*)(gsp + 0);
+                        Log("  '%ls': GetSanctifyingAvailable() = %s\n", nb, avail ? "TRUE" : "FALSE");
+                    } __except(EXCEPTION_EXECUTE_HANDLER) {
+                        Log("  '%ls': GetSanctifyingAvailable() crashed\n", nb);
+                    }
+                    break;
+                }
             }
         }
     }

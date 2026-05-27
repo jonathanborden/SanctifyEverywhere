@@ -42,10 +42,14 @@ static void* gGameplayStaticsCDO = nullptr;
 // Constants (Deadzone Rogue v1.4 - stable across ASLR)
 // ============================================================
 
-static const int64_t FNAME_TOSTRING_OFFSET = -0x0A27FB50; // FNameToString = GUObjectArray_struct + this
+static const int64_t FNAME_TOSTRING_OFFSET = -0x0A27FB50;
 static const int PROCESS_EVENT_VTABLE_SLOT = 0x4C;
 static const int BEGIN_SPAWN_RETVAL_OFFSET = 0x88;
 static const int FINISH_SPAWN_RETVAL_OFFSET = 120;
+
+// Brute-forced property offsets (constant per game version)
+static const int GAMESTATE_SANCTIFY_BOOL_OFFSET = 0x592;
+static const int PLAYER_SANCTIFY_BOOL_OFFSET = 0x13A;
 
 // ============================================================
 // Forward declarations & types
@@ -80,6 +84,8 @@ static struct {
     void* gameModeInstance;
     void* enableSAFunc;
     void* safeRoomMgr;
+    void* gameStateInst;
+    void* playerSanctifyComp;
     uintptr_t processEventAddr;
     double spawnX[32], spawnY[32], spawnZ[32];
     int spawnCount;
@@ -187,135 +193,23 @@ static void SpawnOneAnvil(ProcessEvent_fn pe, double sx, double sy, double sz) {
 }
 
 static void GameThreadSpawn() {
-    Log("[GT] Spawning %d anvils on thread %lu\n", gSpawnReq.spawnCount, GetCurrentThreadId());
+    Log("[GT] Spawning %d anvils\n", gSpawnReq.spawnCount);
     ProcessEvent_fn pe = (ProcessEvent_fn)gSpawnReq.processEventAddr;
 
     for (int i = 0; i < gSpawnReq.spawnCount; i++) {
         SpawnOneAnvil(pe, gSpawnReq.spawnX[i], gSpawnReq.spawnY[i], gSpawnReq.spawnZ[i]);
     }
 
-    // Check if GetSanctifyingAvailable is now TRUE
-    void* gsAvailFunc = nullptr;
-    void* gameStateInst = nullptr;
-    {
-        wchar_t nb2[256], cb2[256];
-        for (int i = 0; i < gNumElements; i++) {
-            void* o = GetUObject(i); if (!o) continue;
-            if (!GetObjectName(o, nb2, 256)) continue;
-            if (wcscmp(nb2, L"GetSanctifyingAvailable") == 0) {
-                int32_t ps2 = 0; SafeRead32((uintptr_t)o + 0x58, &ps2);
-                if (ps2 <= 8) { gsAvailFunc = o; }
-            }
-        }
-        for (int i = 0; i < gNumElements && !gameStateInst; i++) {
-            void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
-            void* c = GetObjClass(o); if (!c) continue;
-            if (!GetObjectName(c, cb2, 256)) continue;
-            if (wcsstr(cb2, L"GameState") && wcsstr(cb2, L"RogueLite")) {
-                gameStateInst = o;
-            }
-        }
-    }
-    if (gsAvailFunc && gameStateInst) {
-        __declspec(align(16)) uint8_t gp[64] = {};
-        __try {
-            pe(gameStateInst, gsAvailFunc, gp);
-            Log("[GT] GetSanctifyingAvailable = %s\n", gp[0] ? "TRUE" : "FALSE");
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            Log("[GT] GetSanctifyingAvailable crashed\n");
-        }
-
-        // If still FALSE, brute-force find the bool property and set it TRUE
-        if (!gp[0] && IsSafeToRead(gameStateInst, 0x800)) {
-            Log("[GT] Brute-force searching GameState for sanctify bool...\n");
-            uint8_t* gs = (uint8_t*)gameStateInst;
-            bool found = false;
-
-            // Skip UObject header (first 0x28 bytes) and scan up to 2KB
-            for (int off = 0x28; off < 0x800 && !found; off++) {
-                if (gs[off] != 0) continue; // Only try bytes that are currently 0
-
-                // Flip to 1
-                gs[off] = 1;
-
-                // Check if GetSanctifyingAvailable now returns TRUE
-                __declspec(align(16)) uint8_t check[64] = {};
-                __try {
-                    pe(gameStateInst, gsAvailFunc, check);
-                    if (check[0]) {
-                        Log("[GT] *** FOUND! GameState+0x%X = sanctify bool! Set to TRUE ***\n", off);
-                        found = true;
-                        // Leave it as TRUE!
-                    } else {
-                        // Not the right byte, restore
-                        gs[off] = 0;
-                    }
-                } __except(EXCEPTION_EXECUTE_HANDLER) {
-                    gs[off] = 0; // Restore on crash
-                }
-            }
-
-            if (!found) {
-                Log("[GT] Bool not found in first 0x800 bytes of GameState\n");
-            }
-        }
+    // Set GameState sanctify bool using cached offset (instant — no scanning)
+    if (gSpawnReq.gameStateInst && IsSafeToRead(gSpawnReq.gameStateInst, GAMESTATE_SANCTIFY_BOOL_OFFSET + 1)) {
+        ((uint8_t*)gSpawnReq.gameStateInst)[GAMESTATE_SANCTIFY_BOOL_OFFSET] = 1;
+        Log("[GT] GameState+0x%X set TRUE\n", GAMESTATE_SANCTIFY_BOOL_OFFSET);
     }
 
-    // Also brute-force the player's ValPlayerSanctifyComponent bool
-    void* isSanctAvailFunc = nullptr;
-    {
-        wchar_t fnb[256];
-        for (int i = 0; i < gNumElements && !isSanctAvailFunc; i++) {
-            void* o = GetUObject(i); if (!o) continue;
-            if (!GetObjectName(o, fnb, 256) || wcscmp(fnb, L"IsSanctifyingAvailable") != 0) continue;
-            int32_t ps2 = 0; SafeRead32((uintptr_t)o + 0x58, &ps2);
-            if (ps2 <= 8) isSanctAvailFunc = o;
-        }
-    }
-    if (isSanctAvailFunc) {
-        wchar_t cnb[256], onb[256];
-        for (int i = 0; i < gNumElements; i++) {
-            void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
-            void* c = GetObjClass(o); if (!c) continue;
-            if (!GetObjectName(c, cnb, 256) || !wcsstr(cnb, L"ValPlayerSanctifyComponent")) continue;
-            GetObjectName(o, onb, 256);
-            // Skip the GEN_VARIABLE (CDO template)
-            if (wcsstr(onb, L"GEN_VARIABLE")) continue;
-
-            Log("[GT] Checking player sanctify component '%ls'...\n", onb);
-
-            // Check current state
-            __declspec(align(16)) uint8_t chk[64] = {};
-            __try { pe(o, isSanctAvailFunc, chk); }
-            __except(EXCEPTION_EXECUTE_HANDLER) { continue; }
-
-            if (chk[0]) {
-                Log("[GT] Already TRUE, skipping\n");
-                continue;
-            }
-
-            // Brute-force find the bool
-            Log("[GT] IsSanctifyingAvailable=FALSE, brute-forcing...\n");
-            if (IsSafeToRead(o, 0x400)) {
-                uint8_t* mem = (uint8_t*)o;
-                bool found2 = false;
-                for (int off = 0x28; off < 0x400 && !found2; off++) {
-                    if (mem[off] != 0) continue;
-                    mem[off] = 1;
-                    __declspec(align(16)) uint8_t chk2[64] = {};
-                    __try {
-                        pe(o, isSanctAvailFunc, chk2);
-                        if (chk2[0]) {
-                            Log("[GT] *** FOUND! PlayerSanctifyComponent+0x%X = sanctify bool! ***\n", off);
-                            found2 = true;
-                        } else {
-                            mem[off] = 0;
-                        }
-                    } __except(EXCEPTION_EXECUTE_HANDLER) { mem[off] = 0; }
-                }
-                if (!found2) Log("[GT] Player sanctify bool not found in first 0x400 bytes\n");
-            }
-        }
+    // Set player sanctify component bool using cached offset (instant)
+    if (gSpawnReq.playerSanctifyComp && IsSafeToRead(gSpawnReq.playerSanctifyComp, PLAYER_SANCTIFY_BOOL_OFFSET + 1)) {
+        ((uint8_t*)gSpawnReq.playerSanctifyComp)[PLAYER_SANCTIFY_BOOL_OFFSET] = 1;
+        Log("[GT] PlayerSanctifyComp+0x%X set TRUE\n", PLAYER_SANCTIFY_BOOL_OFFSET);
     }
 
     Log("[GT] *** %d ANVILS SPAWNED! ***\n", gSpawnReq.spawnCount);
@@ -771,96 +665,41 @@ idle:
             }
             gSpawnReq.spawnCount = sc;
 
-            // Find SetSanctifiedAnvil and GameMode instance (background thread — safe)
+            // Single-pass: find GameMode, SafeRoomMgr, GameState, PlayerSanctifyComp
             void* ssaFunc = FindUFunc(L"SetSanctifiedAnvil", 4, 16);
-            void* gmInst = nullptr;
-            if (ssaFunc) {
-                wchar_t cb3[256];
-                for (int i = 0; i < gNumElements && !gmInst; i++) {
+            void* enableSAFunc = FindUFunc(L"EnableSanctifiedAnvil", 100, 200);
+            void* gmInst = nullptr, *safeRoomMgr = nullptr, *gsInst = nullptr, *pscInst = nullptr;
+            {
+                wchar_t cbn[256], obn[256];
+                for (int i = 0; i < gNumElements; i++) {
                     void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
                     void* c = GetObjClass(o); if (!c) continue;
-                    if (!GetObjectName(c, cb3, 256)) continue;
-                    if (wcsstr(cb3, L"GameMode") && wcsstr(cb3, L"Dungeon")) {
-                        wchar_t on[256]; GetObjectName(o, on, 256);
-                        Log("GameMode: '%ls' (class '%ls')\n", on, cb3);
+                    if (!GetObjectName(c, cbn, 256)) continue;
+                    if (!gmInst && wcsstr(cbn, L"GameMode") && (wcsstr(cbn, L"Dungeon") || wcsstr(cbn, L"RogueLite")))
                         gmInst = o;
-                    }
-                }
-                if (!gmInst) {
-                    // Broader search
-                    for (int i = 0; i < gNumElements && !gmInst; i++) {
-                        void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
-                        void* c = GetObjClass(o); if (!c) continue;
-                        if (!GetObjectName(c, cb3, 256)) continue;
-                        if (wcsstr(cb3, L"GameMode") && wcsstr(cb3, L"RogueLite")) {
-                            wchar_t on[256]; GetObjectName(o, on, 256);
-                            Log("GameMode (broad): '%ls' (class '%ls')\n", on, cb3);
-                            gmInst = o;
-                        }
+                    if (!safeRoomMgr && wcsstr(cbn, L"EncounterManager") && wcsstr(cbn, L"SafeRoom"))
+                        safeRoomMgr = o;
+                    if (!gsInst && wcsstr(cbn, L"GameState") && wcsstr(cbn, L"RogueLite"))
+                        gsInst = o;
+                    if (!pscInst && wcsstr(cbn, L"ValPlayerSanctifyComponent")) {
+                        GetObjectName(o, obn, 256);
+                        if (!wcsstr(obn, L"GEN_VARIABLE")) pscInst = o;
                     }
                 }
             }
             gSpawnReq.setSanctifiedAnvilFunc = ssaFunc;
             gSpawnReq.gameModeInstance = gmInst;
-            Log("SetSanctifiedAnvil=%s GameMode=%s\n", ssaFunc?"OK":"NO", gmInst?"OK":"NO");
-
-            // Find EnableSanctifiedAnvil on the safe room encounter manager
-            void* enableSAFunc = FindUFunc(L"EnableSanctifiedAnvil", 100, 200);
-            void* safeRoomMgr = nullptr;
-            if (enableSAFunc) {
-                wchar_t cb4[256];
-                for (int i = 0; i < gNumElements && !safeRoomMgr; i++) {
-                    void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
-                    void* c = GetObjClass(o); if (!c) continue;
-                    if (!GetObjectName(c, cb4, 256)) continue;
-                    if (wcsstr(cb4, L"EncounterManager") && wcsstr(cb4, L"SafeRoom")) {
-                        wchar_t on[256]; GetObjectName(o, on, 256);
-                        Log("SafeRoom EncounterMgr: '%ls' (class '%ls')\n", on, cb4);
-                        safeRoomMgr = o;
-                    }
-                }
-            }
             gSpawnReq.enableSAFunc = enableSAFunc;
             gSpawnReq.safeRoomMgr = safeRoomMgr;
-            Log("EnableSanctifiedAnvil=%s SafeRoomMgr=%s\n", enableSAFunc?"OK":"NO", safeRoomMgr?"OK":"NO");
-
-            // Find GameState and try to enable sanctification
-            // GetSanctifyingAvailable returns FALSE in non-Zone4 — we need to set it TRUE
-            void* getSanctAvailFunc = FindUFunc(L"GetSanctifyingAvailable", 0, 8);
-            if (getSanctAvailFunc) {
-                // Find its Outer to determine which class it belongs to
-                void* gsOuter = GetObjOuter(getSanctAvailFunc);
-                wchar_t gsOuterName[256] = {};
-                if (gsOuter) GetObjectName(gsOuter, gsOuterName, 256);
-                Log("GetSanctifyingAvailable owner: '%ls'\n", gsOuterName);
-
-                // The bool property is likely right at the start of the return params (PropsSize=1)
-                // If we can find the GameState instance and the property offset,
-                // we can write TRUE directly.
-
-                // For now, search for ANY function named "Set*Sanctif*" or "*Sanctif*Available"
-                wchar_t fnb[256];
-                Log("Searching for sanctify setter functions...\n");
-                for (int i = 0; i < gNumElements; i++) {
-                    void* o = GetUObject(i); if (!o) continue;
-                    if (!GetObjectName(o, fnb, 256)) continue;
-                    void* oc = GetObjClass(o); if (!oc) continue;
-                    wchar_t ocn[256]; GetObjectName(oc, ocn, 256);
-                    if (wcscmp(ocn, L"Function") != 0) continue;
-                    if (wcsstr(fnb, L"Sanctif") && (wcsstr(fnb, L"Set") || wcsstr(fnb, L"Enable") || wcsstr(fnb, L"Available"))) {
-                        int32_t ps = 0; SafeRead32((uintptr_t)o + 0x58, &ps);
-                        void* fo = GetObjOuter(o);
-                        wchar_t fon[256] = {}; if (fo) GetObjectName(fo, fon, 256);
-                        Log("  '%ls' PS=%d owner='%ls'\n", fnb, ps, fon);
-                    }
-                }
-            }
+            gSpawnReq.gameStateInst = gsInst;
+            gSpawnReq.playerSanctifyComp = pscInst;
+            Log("GM=%s SRM=%s GS=%s PSC=%s SSA=%s ESA=%s\n",
+                gmInst?"OK":"NO", safeRoomMgr?"OK":"NO", gsInst?"OK":"NO",
+                pscInst?"OK":"NO", ssaFunc?"OK":"NO", enableSAFunc?"OK":"NO");
 
             Log("Spawning %d anvils...\n", sc);
             gSpawnReq.resultReady = false;
             gSpawnReq.success = false;
-
-            Log("Spawning at (%.0f, %.0f, %.0f)...\n", gSpawnReq.spawnX, gSpawnReq.spawnY, gSpawnReq.spawnZ);
 
             // Install window timer (the ONLY method proven to produce visible actors)
             TickHook::Uninstall(); // Clean up any previous timer

@@ -665,6 +665,38 @@ idle:
             gSpawnReq.gameModeInstance = gmInst;
             Log("SetSanctifiedAnvil=%s GameMode=%s\n", ssaFunc?"OK":"NO", gmInst?"OK":"NO");
 
+            // Find GameState and try to enable sanctification
+            // GetSanctifyingAvailable returns FALSE in non-Zone4 — we need to set it TRUE
+            void* getSanctAvailFunc = FindUFunc(L"GetSanctifyingAvailable", 0, 8);
+            if (getSanctAvailFunc) {
+                // Find its Outer to determine which class it belongs to
+                void* gsOuter = GetObjOuter(getSanctAvailFunc);
+                wchar_t gsOuterName[256] = {};
+                if (gsOuter) GetObjectName(gsOuter, gsOuterName, 256);
+                Log("GetSanctifyingAvailable owner: '%ls'\n", gsOuterName);
+
+                // The bool property is likely right at the start of the return params (PropsSize=1)
+                // If we can find the GameState instance and the property offset,
+                // we can write TRUE directly.
+
+                // For now, search for ANY function named "Set*Sanctif*" or "*Sanctif*Available"
+                wchar_t fnb[256];
+                Log("Searching for sanctify setter functions...\n");
+                for (int i = 0; i < gNumElements; i++) {
+                    void* o = GetUObject(i); if (!o) continue;
+                    if (!GetObjectName(o, fnb, 256)) continue;
+                    void* oc = GetObjClass(o); if (!oc) continue;
+                    wchar_t ocn[256]; GetObjectName(oc, ocn, 256);
+                    if (wcscmp(ocn, L"Function") != 0) continue;
+                    if (wcsstr(fnb, L"Sanctif") && (wcsstr(fnb, L"Set") || wcsstr(fnb, L"Enable") || wcsstr(fnb, L"Available"))) {
+                        int32_t ps = 0; SafeRead32((uintptr_t)o + 0x58, &ps);
+                        void* fo = GetObjOuter(o);
+                        wchar_t fon[256] = {}; if (fo) GetObjectName(fo, fon, 256);
+                        Log("  '%ls' PS=%d owner='%ls'\n", fnb, ps, fon);
+                    }
+                }
+            }
+
             Log("Spawning %d anvils...\n", sc);
             gSpawnReq.resultReady = false;
             gSpawnReq.success = false;

@@ -1,0 +1,24 @@
+LIBRARY dwmapi
+EXPORTS
+    DwmIsCompositionEnabled
+    DwmEnableBlurBehindWindow
+    DwmExtendFrameIntoClientArea
+    DwmGetColorizationColor
+    DwmGetWindowAttribute
+    DwmSetWindowAttribute
+    DwmFlush
+    DwmDefWindowProc
+    DwmRegisterThumbnail
+    DwmUnregisterThumbnail
+    DwmUpdateThumbnailProperties
+    DwmQueryThumbnailSourceSize
+    DwmEnableComposition
+    DwmGetTransportAttributes
+    DwmSetPresentParameters
+    DwmInvalidateIconicBitmaps
+    DwmSetIconicThumbnail
+    DwmSetIconicLivePreviewBitmap
+    DwmGetGraphicsStreamTransformHint
+    DwmGetGraphicsStreamClient
+    DwmEnableMMCSS
+    DwmGetCompositionTimingInfo

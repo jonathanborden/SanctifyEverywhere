@@ -224,6 +224,41 @@ static void GameThreadSpawn() {
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             Log("[GT] GetSanctifyingAvailable crashed\n");
         }
+
+        // If still FALSE, brute-force find the bool property and set it TRUE
+        if (!gp[0] && IsSafeToRead(gameStateInst, 0x800)) {
+            Log("[GT] Brute-force searching GameState for sanctify bool...\n");
+            uint8_t* gs = (uint8_t*)gameStateInst;
+            bool found = false;
+
+            // Skip UObject header (first 0x28 bytes) and scan up to 2KB
+            for (int off = 0x28; off < 0x800 && !found; off++) {
+                if (gs[off] != 0) continue; // Only try bytes that are currently 0
+
+                // Flip to 1
+                gs[off] = 1;
+
+                // Check if GetSanctifyingAvailable now returns TRUE
+                __declspec(align(16)) uint8_t check[64] = {};
+                __try {
+                    pe(gameStateInst, gsAvailFunc, check);
+                    if (check[0]) {
+                        Log("[GT] *** FOUND! GameState+0x%X = sanctify bool! Set to TRUE ***\n", off);
+                        found = true;
+                        // Leave it as TRUE!
+                    } else {
+                        // Not the right byte, restore
+                        gs[off] = 0;
+                    }
+                } __except(EXCEPTION_EXECUTE_HANDLER) {
+                    gs[off] = 0; // Restore on crash
+                }
+            }
+
+            if (!found) {
+                Log("[GT] Bool not found in first 0x800 bytes of GameState\n");
+            }
+        }
     }
 
     Log("[GT] *** %d ANVILS SPAWNED! ***\n", gSpawnReq.spawnCount);

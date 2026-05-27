@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <atomic>
 #include <cstring>
+#include <cmath>
 
 // ============================================================
 // Globals
@@ -582,27 +583,33 @@ idle:
             gSpawnReq.constructionFunc = freshConstruction;
             gSpawnReq.beginPlayFunc = freshBeginPlay;
             gSpawnReq.rerunConstructionFunc = FindUFunc(L"RerunConstructionScripts", 0, 16);
-            // Try fabricator position + known offset first
+            // Find NEAREST fabricator to player, then apply offset
             double spawnX = px + 300, spawnY = py, spawnZ = pz;
             bool usedFab = false;
             {
                 wchar_t cb2[256];
-                for (int i = 0; i < gNumElements && !usedFab; i++) {
+                double bestDist = 1e18;
+                for (int i = 0; i < gNumElements; i++) {
                     void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
                     void* c = GetObjClass(o); if (!c) continue;
                     if (!GetObjectName(c, cb2, 256) || wcscmp(cb2, L"BP_Fabricator_C") != 0) continue;
                     double fx, fy, fz;
                     if (GetActorLoc(o, &fx, &fy, &fz)) {
-                        spawnX = fx + (-576.8);
-                        spawnY = fy + 35.5;
-                        spawnZ = fz + (-123.1);
-                        Log("Fabricator at (%.1f, %.1f, %.1f) -> Anvil at (%.1f, %.1f, %.1f)\n",
-                            fx, fy, fz, spawnX, spawnY, spawnZ);
-                        usedFab = true;
+                        double dx = fx - px, dy = fy - py, dz = fz - pz;
+                        double dist = dx*dx + dy*dy + dz*dz;
+                        Log("  Fab at (%.0f, %.0f, %.0f) dist=%.0f\n", fx, fy, fz, sqrt(dist));
+                        if (dist < bestDist) {
+                            bestDist = dist;
+                            spawnX = fx + (-576.8);
+                            spawnY = fy + 35.5;
+                            spawnZ = fz + (-123.1);
+                            usedFab = true;
+                        }
                     }
                 }
             }
-            if (!usedFab) Log("No fabricator with position found, using player offset\n");
+            if (usedFab) Log("Nearest fab -> Anvil at (%.0f, %.0f, %.0f)\n", spawnX, spawnY, spawnZ);
+            else Log("No fabricator found, using player offset\n");
 
             gSpawnReq.spawnX = spawnX;
             gSpawnReq.spawnY = spawnY;

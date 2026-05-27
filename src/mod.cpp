@@ -261,6 +261,63 @@ static void GameThreadSpawn() {
         }
     }
 
+    // Also brute-force the player's ValPlayerSanctifyComponent bool
+    void* isSanctAvailFunc = nullptr;
+    {
+        wchar_t fnb[256];
+        for (int i = 0; i < gNumElements && !isSanctAvailFunc; i++) {
+            void* o = GetUObject(i); if (!o) continue;
+            if (!GetObjectName(o, fnb, 256) || wcscmp(fnb, L"IsSanctifyingAvailable") != 0) continue;
+            int32_t ps2 = 0; SafeRead32((uintptr_t)o + 0x58, &ps2);
+            if (ps2 <= 8) isSanctAvailFunc = o;
+        }
+    }
+    if (isSanctAvailFunc) {
+        wchar_t cnb[256], onb[256];
+        for (int i = 0; i < gNumElements; i++) {
+            void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
+            void* c = GetObjClass(o); if (!c) continue;
+            if (!GetObjectName(c, cnb, 256) || !wcsstr(cnb, L"ValPlayerSanctifyComponent")) continue;
+            GetObjectName(o, onb, 256);
+            // Skip the GEN_VARIABLE (CDO template)
+            if (wcsstr(onb, L"GEN_VARIABLE")) continue;
+
+            Log("[GT] Checking player sanctify component '%ls'...\n", onb);
+
+            // Check current state
+            __declspec(align(16)) uint8_t chk[64] = {};
+            __try { pe(o, isSanctAvailFunc, chk); }
+            __except(EXCEPTION_EXECUTE_HANDLER) { continue; }
+
+            if (chk[0]) {
+                Log("[GT] Already TRUE, skipping\n");
+                continue;
+            }
+
+            // Brute-force find the bool
+            Log("[GT] IsSanctifyingAvailable=FALSE, brute-forcing...\n");
+            if (IsSafeToRead(o, 0x400)) {
+                uint8_t* mem = (uint8_t*)o;
+                bool found2 = false;
+                for (int off = 0x28; off < 0x400 && !found2; off++) {
+                    if (mem[off] != 0) continue;
+                    mem[off] = 1;
+                    __declspec(align(16)) uint8_t chk2[64] = {};
+                    __try {
+                        pe(o, isSanctAvailFunc, chk2);
+                        if (chk2[0]) {
+                            Log("[GT] *** FOUND! PlayerSanctifyComponent+0x%X = sanctify bool! ***\n", off);
+                            found2 = true;
+                        } else {
+                            mem[off] = 0;
+                        }
+                    } __except(EXCEPTION_EXECUTE_HANDLER) { mem[off] = 0; }
+                }
+                if (!found2) Log("[GT] Player sanctify bool not found in first 0x400 bytes\n");
+            }
+        }
+    }
+
     Log("[GT] *** %d ANVILS SPAWNED! ***\n", gSpawnReq.spawnCount);
     gSpawnReq.success = true;
     gSpawnReq.resultReady = true;

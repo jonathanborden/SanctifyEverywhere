@@ -78,6 +78,8 @@ static struct {
     void* rerunConstructionFunc;
     void* setSanctifiedAnvilFunc;
     void* gameModeInstance;
+    void* enableSAFunc;
+    void* safeRoomMgr;
     uintptr_t processEventAddr;
     double spawnX[32], spawnY[32], spawnZ[32];
     int spawnCount;
@@ -165,6 +167,19 @@ static void SpawnOneAnvil(ProcessEvent_fn pe, double sx, double sy, double sz) {
             Log("[GT] SetSanctifiedAnvil OK\n");
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             Log("[GT] SetSanctifiedAnvil CRASHED\n");
+        }
+    }
+
+    // Enable sanctification via the safe room encounter manager
+    if (gSpawnReq.enableSAFunc && gSpawnReq.safeRoomMgr && actor) {
+        __declspec(align(16)) uint8_t esp[256] = {};
+        // EnableSanctifiedAnvil PS=144 — likely takes an actor reference
+        *(void**)(esp + 0) = actor;
+        __try {
+            pe(gSpawnReq.safeRoomMgr, gSpawnReq.enableSAFunc, esp);
+            Log("[GT] EnableSanctifiedAnvil OK!\n");
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            Log("[GT] EnableSanctifiedAnvil CRASHED\n");
         }
     }
 
@@ -664,6 +679,26 @@ idle:
             gSpawnReq.setSanctifiedAnvilFunc = ssaFunc;
             gSpawnReq.gameModeInstance = gmInst;
             Log("SetSanctifiedAnvil=%s GameMode=%s\n", ssaFunc?"OK":"NO", gmInst?"OK":"NO");
+
+            // Find EnableSanctifiedAnvil on the safe room encounter manager
+            void* enableSAFunc = FindUFunc(L"EnableSanctifiedAnvil", 100, 200);
+            void* safeRoomMgr = nullptr;
+            if (enableSAFunc) {
+                wchar_t cb4[256];
+                for (int i = 0; i < gNumElements && !safeRoomMgr; i++) {
+                    void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
+                    void* c = GetObjClass(o); if (!c) continue;
+                    if (!GetObjectName(c, cb4, 256)) continue;
+                    if (wcsstr(cb4, L"EncounterManager") && wcsstr(cb4, L"SafeRoom")) {
+                        wchar_t on[256]; GetObjectName(o, on, 256);
+                        Log("SafeRoom EncounterMgr: '%ls' (class '%ls')\n", on, cb4);
+                        safeRoomMgr = o;
+                    }
+                }
+            }
+            gSpawnReq.enableSAFunc = enableSAFunc;
+            gSpawnReq.safeRoomMgr = safeRoomMgr;
+            Log("EnableSanctifiedAnvil=%s SafeRoomMgr=%s\n", enableSAFunc?"OK":"NO", safeRoomMgr?"OK":"NO");
 
             // Find GameState and try to enable sanctification
             // GetSanctifyingAvailable returns FALSE in non-Zone4 — we need to set it TRUE

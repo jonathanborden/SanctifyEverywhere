@@ -386,21 +386,30 @@ static bool CacheObjects() {
     return gBeginSpawnFunc && gFinishSpawnFunc && gGameplayStaticsCDO && gProcessEventAddr;
 }
 
-// Get player location (fast - just one ProcessEvent call)
+// Get actor location via ProcessEvent on any object
+static bool GetActorLoc(void* actor, double* x, double* y, double* z) {
+    if (!gGetLocFunc || !gProcessEventAddr || !actor) return false;
+    __declspec(align(16)) uint8_t lp[128] = {};
+    __try {
+        ((ProcessEvent_fn)gProcessEventAddr)(actor, gGetLocFunc, lp);
+        *x = *(double*)(lp); *y = *(double*)(lp+8); *z = *(double*)(lp+16);
+        return (*x != 0 || *y != 0 || *z != 0);
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Get player PAWN location (not controller!)
 static bool GetPlayerLoc(double* x, double* y, double* z) {
     if (!gGetLocFunc || !gProcessEventAddr) return false;
-    wchar_t nb[256], cb[256];
-    // Find PlayerController instance
-    for (int i = 0; i < gNumElements; i++) {
-        void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
-        void* c = GetObjClass(o); if (!c) continue;
-        if (!GetObjectName(c, cb, 256) || !wcsstr(cb, L"PlayerController")) continue;
-        __declspec(align(16)) uint8_t lp[128] = {};
-        __try {
-            ((ProcessEvent_fn)gProcessEventAddr)(o, gGetLocFunc, lp);
-            *x = *(double*)(lp); *y = *(double*)(lp+8); *z = *(double*)(lp+16);
-            if (*x != 0 || *y != 0 || *z != 0) return true;
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    wchar_t cb[256];
+    // Try pawn classes first (the actual character in the world)
+    const wchar_t* pawnClasses[] = {L"CharPlayer_Dungeon", L"CharPlayer", L"ValChar", nullptr};
+    for (int pc = 0; pawnClasses[pc]; pc++) {
+        for (int i = 0; i < gNumElements; i++) {
+            void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
+            void* c = GetObjClass(o); if (!c) continue;
+            if (!GetObjectName(c, cb, 256) || !wcsstr(cb, pawnClasses[pc])) continue;
+            if (GetActorLoc(o, x, y, z)) return true;
+        }
     }
     return false;
 }
@@ -573,9 +582,31 @@ idle:
             gSpawnReq.constructionFunc = freshConstruction;
             gSpawnReq.beginPlayFunc = freshBeginPlay;
             gSpawnReq.rerunConstructionFunc = FindUFunc(L"RerunConstructionScripts", 0, 16);
-            gSpawnReq.spawnX = px + 300;
-            gSpawnReq.spawnY = py;
-            gSpawnReq.spawnZ = pz;
+            // Try fabricator position + known offset first
+            double spawnX = px + 300, spawnY = py, spawnZ = pz;
+            bool usedFab = false;
+            {
+                wchar_t cb2[256];
+                for (int i = 0; i < gNumElements && !usedFab; i++) {
+                    void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
+                    void* c = GetObjClass(o); if (!c) continue;
+                    if (!GetObjectName(c, cb2, 256) || wcscmp(cb2, L"BP_Fabricator_C") != 0) continue;
+                    double fx, fy, fz;
+                    if (GetActorLoc(o, &fx, &fy, &fz)) {
+                        spawnX = fx + (-576.8);
+                        spawnY = fy + 35.5;
+                        spawnZ = fz + (-123.1);
+                        Log("Fabricator at (%.1f, %.1f, %.1f) -> Anvil at (%.1f, %.1f, %.1f)\n",
+                            fx, fy, fz, spawnX, spawnY, spawnZ);
+                        usedFab = true;
+                    }
+                }
+            }
+            if (!usedFab) Log("No fabricator with position found, using player offset\n");
+
+            gSpawnReq.spawnX = spawnX;
+            gSpawnReq.spawnY = spawnY;
+            gSpawnReq.spawnZ = spawnZ;
             gSpawnReq.resultReady = false;
             gSpawnReq.success = false;
 
@@ -596,11 +627,13 @@ idle:
         }
 
         if (IsKeyJustPressed(VK_F10) && gProcessEventAddr && gGetLocFunc) {
+            SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
+            SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
             double x, y, z;
             if (GetPlayerLoc(&x, &y, &z))
-                Log("F10 POSITION: (%.2f, %.2f, %.2f)\n", x, y, z);
+                Log("F10 PAWN POSITION: (%.2f, %.2f, %.2f)\n", x, y, z);
             else
-                Log("F10: Could not get position\n");
+                Log("F10: Could not get pawn position\n");
         }
 
         if (IsKeyJustPressed(VK_F8) && gObjArrayBase && gFNameToString) {

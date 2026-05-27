@@ -397,23 +397,25 @@ static void* FindClass(const wchar_t* name) {
     return nullptr;
 }
 
-// Cache all needed UFunctions/objects (heavy, run on background thread)
+// Minimal startup cache — just enough to gate F9. F9 does its own full search.
 static bool CacheObjects() {
     SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
-    SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
-    Log("Caching objects (%d total)...\n", gNumElements);
+    Log("Startup scan (%d objects)...\n", gNumElements);
 
-    gBeginSpawnFunc = FindUFunc(L"BeginDeferredActorSpawnFromClass", 100, 200);
-    gFinishSpawnFunc = FindUFunc(L"FinishSpawningActor", 100, 200);
-    gGetLocFunc = FindUFunc(L"K2_GetActorLocation", 20, 50);
-    gSetLocFunc = FindUFunc(L"K2_SetActorLocation", 200, 400);
-    gConstructionFunc = FindUFunc(L"UserConstructionScript", 0, 16);
-    gBeginPlayFunc = FindUFunc(L"ReceiveBeginPlay", 0, 16);
-
+    // Single pass: find BeginSpawn + CDO + GetLoc (minimum needed for F9 gate)
     wchar_t nb[256];
-    for (int i = 0; i < gNumElements && !gGameplayStaticsCDO; i++) {
+    for (int i = 0; i < gNumElements; i++) {
         void* o = GetUObject(i); if (!o) continue;
-        if (GetObjectName(o, nb, 256) && wcscmp(nb, L"Default__GameplayStatics") == 0)
+        if (!GetObjectName(o, nb, 256)) continue;
+        if (!gBeginSpawnFunc && wcscmp(nb, L"BeginDeferredActorSpawnFromClass") == 0) {
+            int32_t ps = 0; SafeRead32((uintptr_t)o + 0x58, &ps);
+            if (ps >= 100 && ps <= 200) gBeginSpawnFunc = o;
+        }
+        if (!gGetLocFunc && wcscmp(nb, L"K2_GetActorLocation") == 0) {
+            int32_t ps = 0; SafeRead32((uintptr_t)o + 0x58, &ps);
+            if (ps >= 20 && ps <= 50) gGetLocFunc = o;
+        }
+        if (!gGameplayStaticsCDO && wcscmp(nb, L"Default__GameplayStatics") == 0)
             gGameplayStaticsCDO = o;
     }
 
@@ -675,160 +677,7 @@ idle:
                 Log("F10: Could not get pawn position\n");
         }
 
-        if (IsKeyJustPressed(VK_F8) && gObjArrayBase && gFNameToString && gProcessEventAddr) {
-            SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
-            SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
-            Log("\n=== F8: THOROUGH SANCTIFY DIAGNOSTICS (%d objects) ===\n", gNumElements);
-            wchar_t nb[256], cb[256];
-            ProcessEvent_fn pe = (ProcessEvent_fn)gProcessEventAddr;
-
-            // 1. All sanctify-related boolean checks
-            Log("--- Boolean State Checks ---\n");
-
-            // GetSanctifyingAvailable on GameState
-            void* gsAvail = FindUFunc(L"GetSanctifyingAvailable", 0, 8);
-            if (gsAvail) {
-                for (int i = 0; i < gNumElements; i++) {
-                    void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
-                    void* c = GetObjClass(o); if (!c) continue;
-                    if (!GetObjectName(c, cb, 256) || !wcsstr(cb, L"GameState") || !wcsstr(cb, L"RogueLite")) continue;
-                    __declspec(align(16)) uint8_t p[64] = {};
-                    __try { pe(o, gsAvail, p); Log("  GameState.GetSanctifyingAvailable() = %s\n", p[0]?"TRUE":"FALSE"); }
-                    __except(EXCEPTION_EXECUTE_HANDLER) { Log("  GameState.GetSanctifyingAvailable() crashed\n"); }
-                    break;
-                }
-            }
-
-            // IsSanctifyingAvailable on ValPlayerSanctifyComponent
-            void* isSanctAvail = FindUFunc(L"IsSanctifyingAvailable", 0, 8);
-            if (isSanctAvail) {
-                for (int i = 0; i < gNumElements; i++) {
-                    void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
-                    void* c = GetObjClass(o); if (!c) continue;
-                    if (!GetObjectName(c, cb, 256) || !wcsstr(cb, L"SanctifyComponent")) continue;
-                    GetObjectName(o, nb, 256);
-                    __declspec(align(16)) uint8_t p[64] = {};
-                    __try { pe(o, isSanctAvail, p); Log("  '%ls'.IsSanctifyingAvailable() = %s\n", nb, p[0]?"TRUE":"FALSE"); }
-                    __except(EXCEPTION_EXECUTE_HANDLER) { Log("  '%ls'.IsSanctifyingAvailable() crashed\n", nb); }
-                }
-            }
-
-            // 2. Call ALL sanctify getter functions we know about
-            Log("\n--- All Sanctify Getters ---\n");
-            const wchar_t* getterNames[] = {
-                L"CanSanctifyItem", L"CanSanctifyItemAt", L"IsItemSanctifiable",
-                L"GetSanctificationsLeft", L"GetSanctifyItemCost",
-                L"GetSanctifiableItemAssets", L"GetSanctifyingAvailable",
-                L"GetCheckpointSanctifiedAnvil", L"GetSanctifyComponent",
-                L"GetCheckpointSanctifiedAnvilData", nullptr
-            };
-            for (int g = 0; getterNames[g]; g++) {
-                wchar_t fnb[256];
-                for (int i = 0; i < gNumElements; i++) {
-                    void* o = GetUObject(i); if (!o) continue;
-                    if (!GetObjectName(o, fnb, 256) || wcscmp(fnb, getterNames[g]) != 0) continue;
-                    void* oc = GetObjClass(o); if (!oc) continue;
-                    wchar_t ocn[256]; GetObjectName(oc, ocn, 256);
-                    if (wcscmp(ocn, L"Function") != 0) continue;
-                    int32_t ps = 0; SafeRead32((uintptr_t)o + 0x58, &ps);
-                    void* fo = GetObjOuter(o);
-                    wchar_t fon[256] = {}; if (fo) GetObjectName(fo, fon, 256);
-                    Log("  %ls: PS=%d owner='%ls'\n", getterNames[g], ps, fon);
-                    break;
-                }
-            }
-
-            // 3. Anvil instances — dump first 0x100 bytes to compare native vs spawned
-            Log("\n--- Anvil Instance Memory Comparison ---\n");
-            int anvilIdx = 0;
-            for (int i = 0; i < gNumElements && anvilIdx < 3; i++) {
-                void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
-                void* c = GetObjClass(o); if (!c) continue;
-                if (!GetObjectName(c, cb, 256) || wcscmp(cb, L"BP_SanctifiedAnvil_C") != 0) continue;
-                GetObjectName(o, nb, 256);
-                double ax, ay, az;
-                GetActorLoc(o, &ax, &ay, &az);
-                Log("  Anvil %d: '%ls' at (%.0f, %.0f, %.0f) addr=0x%llX\n", anvilIdx, nb, ax, ay, az, (uintptr_t)o);
-
-                // Dump key property range (skip UObject header, focus on actor-specific data)
-                if (IsSafeToRead(o, 0x400)) {
-                    uint8_t* mem = (uint8_t*)o;
-                    // Dump offsets 0x200-0x400 where game-specific properties usually live
-                    for (int row = 0x200; row < 0x400; row += 32) {
-                        // Only log rows that have non-zero data
-                        bool hasData = false;
-                        for (int b = 0; b < 32; b++) if (mem[row+b]) { hasData = true; break; }
-                        if (!hasData) continue;
-                        Log("    +0x%03X:", row);
-                        for (int b = 0; b < 32; b++) Log(" %02X", mem[row+b]);
-                        Log("\n");
-                    }
-                }
-                anvilIdx++;
-            }
-
-            // 4. Player Sanctify Component — call getters on it
-            Log("\n--- Player Sanctify Component State ---\n");
-            for (int i = 0; i < gNumElements; i++) {
-                void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
-                void* c = GetObjClass(o); if (!c) continue;
-                if (!GetObjectName(c, cb, 256) || !wcsstr(cb, L"ValPlayerSanctifyComponent")) continue;
-                GetObjectName(o, nb, 256);
-                void* outer = GetObjOuter(o);
-                wchar_t on[256] = {}; if (outer) GetObjectName(outer, on, 256);
-                Log("  '%ls' outer='%ls' at 0x%llX\n", nb, on, (uintptr_t)o);
-
-                // Try GetSanctifyComponent on the player controller
-                void* getSanctComp = FindUFunc(L"GetSanctifyComponent", 4, 16);
-                if (getSanctComp && outer) {
-                    __declspec(align(16)) uint8_t gsc[64] = {};
-                    __try {
-                        pe(outer, getSanctComp, gsc);
-                        void* comp = *(void**)(gsc + 0);
-                        Log("    GetSanctifyComponent() = 0x%llX %s\n",
-                            (uintptr_t)comp, (comp == o) ? "(MATCHES)" : "(DIFFERENT!)");
-                    } __except(EXCEPTION_EXECUTE_HANDLER) {}
-                }
-
-                // Dump component memory too
-                if (IsSafeToRead(o, 0x200)) {
-                    uint8_t* mem = (uint8_t*)o;
-                    for (int row = 0x80; row < 0x200; row += 32) {
-                        bool hasData = false;
-                        for (int b = 0; b < 32; b++) if (mem[row+b]) { hasData = true; break; }
-                        if (!hasData) continue;
-                        Log("    +0x%03X:", row);
-                        for (int b = 0; b < 32; b++) Log(" %02X", mem[row+b]);
-                        Log("\n");
-                    }
-                }
-            }
-
-            // 5. Safe room encounter manager state
-            Log("\n--- SafeRoom EncounterManager ---\n");
-            for (int i = 0; i < gNumElements; i++) {
-                void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
-                void* c = GetObjClass(o); if (!c) continue;
-                if (!GetObjectName(c, cb, 256) || !wcsstr(cb, L"EncounterManager") || !wcsstr(cb, L"SafeRoom")) continue;
-                GetObjectName(o, nb, 256);
-                Log("  '%ls' (class '%ls')\n", nb, cb);
-
-                // Try CheckCanEnableSanctifiedAnvil
-                void* checkFunc = FindUFunc(L"CheckCanEnableSanctifiedAnvil", 30, 60);
-                if (checkFunc) {
-                    __declspec(align(16)) uint8_t cfp[64] = {};
-                    __try {
-                        pe(o, checkFunc, cfp);
-                        Log("    CheckCanEnableSanctifiedAnvil() returned (first byte = %d)\n", cfp[0]);
-                    } __except(EXCEPTION_EXECUTE_HANDLER) {
-                        Log("    CheckCanEnableSanctifiedAnvil() crashed\n");
-                    }
-                }
-                break;
-            }
-
-            Log("\n=== END DIAGNOSTICS ===\n");
-        }
+        // F8 removed — diagnostics no longer needed
     }
     return 0;
 }

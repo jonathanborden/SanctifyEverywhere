@@ -77,23 +77,22 @@ static struct {
     void* beginPlayFunc;
     void* rerunConstructionFunc;
     uintptr_t processEventAddr;
-    double spawnX, spawnY, spawnZ;
+    double spawnX[32], spawnY[32], spawnZ[32];
+    int spawnCount;
     volatile bool resultReady;
     volatile bool success;
 } gSpawnReq = {};
 
-static void GameThreadSpawn() {
-    Log("[GT] Spawning! ThreadID=%lu\n", GetCurrentThreadId());
-    ProcessEvent_fn pe = (ProcessEvent_fn)gSpawnReq.processEventAddr;
+static void SpawnOneAnvil(ProcessEvent_fn pe, double sx, double sy, double sz) {
 
     // BeginDeferredActorSpawnFromClass
     __declspec(align(16)) uint8_t p[256] = {};
     *(void**)(p + 0) = gSpawnReq.gameWorld;
     *(void**)(p + 8) = gSpawnReq.bpAnvilClass;
     *(double*)(p + 16) = 0; *(double*)(p + 24) = 0; *(double*)(p + 32) = 0; *(double*)(p + 40) = 1.0; // Quat identity
-    *(double*)(p + 48) = gSpawnReq.spawnX;         // Translation
-    *(double*)(p + 56) = gSpawnReq.spawnY;
-    *(double*)(p + 64) = gSpawnReq.spawnZ;
+    *(double*)(p + 48) = sx;
+    *(double*)(p + 56) = sy;
+    *(double*)(p + 64) = sz;
     *(double*)(p + 72) = 0;
     *(double*)(p + 80) = 1.0; *(double*)(p + 88) = 1.0; *(double*)(p + 96) = 1.0; *(double*)(p + 104) = 0; // Scale
     *(uint8_t*)(p + 112) = 1; // AlwaysSpawn
@@ -110,7 +109,7 @@ static void GameThreadSpawn() {
     __declspec(align(16)) uint8_t fp[256] = {};
     *(void**)(fp + 0) = actor;
     *(double*)(fp + 0x10) = 0; *(double*)(fp + 0x18) = 0; *(double*)(fp + 0x20) = 0; *(double*)(fp + 0x28) = 1.0;
-    *(double*)(fp + 0x30) = gSpawnReq.spawnX; *(double*)(fp + 0x38) = gSpawnReq.spawnY; *(double*)(fp + 0x40) = gSpawnReq.spawnZ;
+    *(double*)(fp + 0x30) = sx; *(double*)(fp + 0x38) = sy; *(double*)(fp + 0x40) = sz;
     *(double*)(fp + 0x48) = 0;
     *(double*)(fp + 0x50) = 1.0; *(double*)(fp + 0x58) = 1.0; *(double*)(fp + 0x60) = 1.0; *(double*)(fp + 0x68) = 0;
 
@@ -124,11 +123,10 @@ static void GameThreadSpawn() {
 
     // Move actor to correct position (FTransform is ignored during spawn)
     if (gSpawnReq.setLocFunc) {
-        Log("[GT] Moving anvil to (%.0f, %.0f, %.0f)...\n", gSpawnReq.spawnX, gSpawnReq.spawnY, gSpawnReq.spawnZ);
         __declspec(align(16)) uint8_t slp[512] = {};
-        *(double*)(slp + 0) = gSpawnReq.spawnX;
-        *(double*)(slp + 8) = gSpawnReq.spawnY;
-        *(double*)(slp + 16) = gSpawnReq.spawnZ;
+        *(double*)(slp + 0) = sx;
+        *(double*)(slp + 8) = sy;
+        *(double*)(slp + 16) = sz;
         // bSweep=false at 24, bTeleport=true near end
         int32_t setRv = 0;
         SafeRead32((uintptr_t)gSpawnReq.setLocFunc + 0xB8, &setRv);
@@ -156,10 +154,18 @@ static void GameThreadSpawn() {
         __except(EXCEPTION_EXECUTE_HANDLER) { Log("[GT] RerunConstructionScripts CRASHED\n"); }
     }
 
-    wchar_t aname[256] = {};
-    GetObjectName(actor, aname, 256);
-    Log("[GT] Actor: '%ls'\n", aname);
-    Log("[GT] *** ANVIL SPAWNED! ***\n");
+    Log("[GT] Anvil at (%.0f, %.0f, %.0f) done\n", sx, sy, sz);
+}
+
+static void GameThreadSpawn() {
+    Log("[GT] Spawning %d anvils on thread %lu\n", gSpawnReq.spawnCount, GetCurrentThreadId());
+    ProcessEvent_fn pe = (ProcessEvent_fn)gSpawnReq.processEventAddr;
+
+    for (int i = 0; i < gSpawnReq.spawnCount; i++) {
+        SpawnOneAnvil(pe, gSpawnReq.spawnX[i], gSpawnReq.spawnY[i], gSpawnReq.spawnZ[i]);
+    }
+
+    Log("[GT] *** %d ANVILS SPAWNED! ***\n", gSpawnReq.spawnCount);
     gSpawnReq.success = true;
     gSpawnReq.resultReady = true;
 }
@@ -583,37 +589,35 @@ idle:
             gSpawnReq.constructionFunc = freshConstruction;
             gSpawnReq.beginPlayFunc = freshBeginPlay;
             gSpawnReq.rerunConstructionFunc = FindUFunc(L"RerunConstructionScripts", 0, 16);
-            // Find NEAREST fabricator to player, then apply offset
-            double spawnX = px + 300, spawnY = py, spawnZ = pz;
-            bool usedFab = false;
+            // Find ALL fabricators and create spawn positions for each
+            int sc = 0;
             {
                 wchar_t cb2[256];
-                double bestDist = 1e18;
-                for (int i = 0; i < gNumElements; i++) {
+                for (int i = 0; i < gNumElements && sc < 32; i++) {
                     void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
                     void* c = GetObjClass(o); if (!c) continue;
                     if (!GetObjectName(c, cb2, 256) || wcscmp(cb2, L"BP_Fabricator_C") != 0) continue;
                     double fx, fy, fz;
                     if (GetActorLoc(o, &fx, &fy, &fz)) {
-                        double dx = fx - px, dy = fy - py, dz = fz - pz;
-                        double dist = dx*dx + dy*dy + dz*dz;
-                        Log("  Fab at (%.0f, %.0f, %.0f) dist=%.0f\n", fx, fy, fz, sqrt(dist));
-                        if (dist < bestDist) {
-                            bestDist = dist;
-                            spawnX = fx + (-576.8);
-                            spawnY = fy + 35.5;
-                            spawnZ = fz + (-123.1);
-                            usedFab = true;
-                        }
+                        gSpawnReq.spawnX[sc] = fx + (-576.8);
+                        gSpawnReq.spawnY[sc] = fy + 35.5;
+                        gSpawnReq.spawnZ[sc] = fz + (-123.1);
+                        Log("  Fab %d at (%.0f, %.0f, %.0f) -> Anvil at (%.0f, %.0f, %.0f)\n",
+                            sc, fx, fy, fz, gSpawnReq.spawnX[sc], gSpawnReq.spawnY[sc], gSpawnReq.spawnZ[sc]);
+                        sc++;
                     }
                 }
             }
-            if (usedFab) Log("Nearest fab -> Anvil at (%.0f, %.0f, %.0f)\n", spawnX, spawnY, spawnZ);
-            else Log("No fabricator found, using player offset\n");
-
-            gSpawnReq.spawnX = spawnX;
-            gSpawnReq.spawnY = spawnY;
-            gSpawnReq.spawnZ = spawnZ;
+            if (sc == 0) {
+                // Fallback: spawn near player
+                gSpawnReq.spawnX[0] = px + 300;
+                gSpawnReq.spawnY[0] = py;
+                gSpawnReq.spawnZ[0] = pz;
+                sc = 1;
+                Log("No fabricators found, spawning near player\n");
+            }
+            gSpawnReq.spawnCount = sc;
+            Log("Spawning %d anvils...\n", sc);
             gSpawnReq.resultReady = false;
             gSpawnReq.success = false;
 

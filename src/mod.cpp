@@ -76,6 +76,8 @@ static struct {
     void* constructionFunc;
     void* beginPlayFunc;
     void* rerunConstructionFunc;
+    void* setSanctifiedAnvilFunc;
+    void* gameModeInstance;
     uintptr_t processEventAddr;
     double spawnX[32], spawnY[32], spawnZ[32];
     int spawnCount;
@@ -152,6 +154,18 @@ static void SpawnOneAnvil(ProcessEvent_fn pe, double sx, double sy, double sz) {
         __declspec(align(16)) uint8_t ip[64] = {};
         __try { pe(actor, gSpawnReq.rerunConstructionFunc, ip); Log("[GT] RerunConstructionScripts OK\n"); }
         __except(EXCEPTION_EXECUTE_HANDLER) { Log("[GT] RerunConstructionScripts CRASHED\n"); }
+    }
+
+    // Register anvil with game's sanctify system
+    if (gSpawnReq.setSanctifiedAnvilFunc && gSpawnReq.gameModeInstance && actor) {
+        __declspec(align(16)) uint8_t ssa[64] = {};
+        *(void**)(ssa + 0) = actor;
+        __try {
+            pe(gSpawnReq.gameModeInstance, gSpawnReq.setSanctifiedAnvilFunc, ssa);
+            Log("[GT] SetSanctifiedAnvil OK\n");
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            Log("[GT] SetSanctifiedAnvil CRASHED\n");
+        }
     }
 
     Log("[GT] Anvil at (%.0f, %.0f, %.0f) done\n", sx, sy, sz);
@@ -617,6 +631,40 @@ idle:
                 Log("No fabricators found, spawning near player\n");
             }
             gSpawnReq.spawnCount = sc;
+
+            // Find SetSanctifiedAnvil and GameMode instance (background thread — safe)
+            void* ssaFunc = FindUFunc(L"SetSanctifiedAnvil", 4, 16);
+            void* gmInst = nullptr;
+            if (ssaFunc) {
+                wchar_t cb3[256];
+                for (int i = 0; i < gNumElements && !gmInst; i++) {
+                    void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
+                    void* c = GetObjClass(o); if (!c) continue;
+                    if (!GetObjectName(c, cb3, 256)) continue;
+                    if (wcsstr(cb3, L"GameMode") && wcsstr(cb3, L"Dungeon")) {
+                        wchar_t on[256]; GetObjectName(o, on, 256);
+                        Log("GameMode: '%ls' (class '%ls')\n", on, cb3);
+                        gmInst = o;
+                    }
+                }
+                if (!gmInst) {
+                    // Broader search
+                    for (int i = 0; i < gNumElements && !gmInst; i++) {
+                        void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
+                        void* c = GetObjClass(o); if (!c) continue;
+                        if (!GetObjectName(c, cb3, 256)) continue;
+                        if (wcsstr(cb3, L"GameMode") && wcsstr(cb3, L"RogueLite")) {
+                            wchar_t on[256]; GetObjectName(o, on, 256);
+                            Log("GameMode (broad): '%ls' (class '%ls')\n", on, cb3);
+                            gmInst = o;
+                        }
+                    }
+                }
+            }
+            gSpawnReq.setSanctifiedAnvilFunc = ssaFunc;
+            gSpawnReq.gameModeInstance = gmInst;
+            Log("SetSanctifiedAnvil=%s GameMode=%s\n", ssaFunc?"OK":"NO", gmInst?"OK":"NO");
+
             Log("Spawning %d anvils...\n", sc);
             gSpawnReq.resultReady = false;
             gSpawnReq.success = false;

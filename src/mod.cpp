@@ -741,6 +741,255 @@ static bool IsKeyJustPressed(int vk) {
 }
 
 // ============================================================
+// Reusable actions — shared by hotkeys (F9/F12) and the auto-on-load path
+// ============================================================
+
+static const int CURRENCY_ID_OFFSET = 0x55C; // FPrimaryAssetId in WBP_Game_Currency_C body
+
+// True when the current level already provides sanctify natively (zone 4):
+// the SafeRoom EncounterManager exists, or GameState bSanctifyingAvailable is set.
+static bool IsZone4Native() {
+    wchar_t cb[256];
+    for (int i = 0; i < gNumElements; i++) {
+        void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
+        void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
+        if (wcsstr(cb, L"EncounterManager") && wcsstr(cb, L"SafeRoom")) return true;
+        if (wcsstr(cb, L"GameState") && wcsstr(cb, L"RogueLite")) {
+            int32_t v = 0;
+            if (SafeRead32((uintptr_t)o + GAMESTATE_SANCTIFY_BOOL_OFFSET, &v) && (v & 0xFF)) return true;
+        }
+    }
+    return false;
+}
+
+// Find the active gameplay World instance (a fresh one is created each level load).
+static void* FindCurrentWorld() {
+    wchar_t cb[256], nb[256];
+    for (int i = 0; i < gNumElements; i++) {
+        void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
+        void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
+        if (wcscmp(cb, L"World") != 0) continue;
+        if (!GetObjectName(o, nb, 256)) continue;
+        if (wcsstr(nb, L"RogueLite") || wcsstr(nb, L"Mission")) return o;
+    }
+    return nullptr;
+}
+
+// True if a SanctityToken currency widget already exists (native zone 4, or already added).
+static bool SanctityWidgetPresent() {
+    wchar_t cb[256], ns[256];
+    for (int i = 0; i < gNumElements; i++) {
+        void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
+        void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
+        if (wcscmp(cb, L"WBP_Game_Currency_C") != 0) continue;
+        uintptr_t a = (uintptr_t)o + CURRENCY_ID_OFFSET + 8; // name FName
+        if (!IsSafeToRead((void*)a, 8)) continue;
+        FName n; SafeRead32(a + 0, &n.ComparisonIndex); SafeRead32(a + 4, &n.Number);
+        if (GetFNameStr(&n, ns, 256) && wcsstr(ns, L"SanctityToken")) return true;
+    }
+    return false;
+}
+
+// Spawn sanctified anvils at every fabricator. Returns 0 = not ready (retry later),
+// 1 = attempted (do not retry — avoids duplicate anvils).
+// requireFabricators: when true (auto path) don't fall back to player position; wait
+// until fabricators have loaded.
+static int DoSpawnAnvils(bool requireFabricators) {
+    Log("=== SPAWN ANVILS (requireFab=%d) ===\n", requireFabricators ? 1 : 0);
+    SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
+    SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
+
+    void* anvilClass = nullptr;
+    void* world = nullptr;
+    void* freshBS = nullptr, *freshFS = nullptr, *freshSL = nullptr;
+    void* freshCS = nullptr, *freshBP = nullptr, *freshCDO = nullptr;
+    void* ssaFunc = nullptr, *esaFunc = nullptr;
+    void* gmInst = nullptr, *srmInst = nullptr, *gsInst = nullptr, *pscInst = nullptr;
+    void* fabInstances[32] = {}; int fabCount = 0;
+    wchar_t nb[256], cb[256], ob[256];
+
+    for (int i = 0; i < gNumElements; i++) {
+        void* o = GetUObject(i); if (!o) continue;
+        if (!GetObjectName(o, nb, 256)) continue;
+
+        int32_t ps = 0;
+        if (wcscmp(nb, L"BeginDeferredActorSpawnFromClass") == 0) {
+            SafeRead32((uintptr_t)o + 0x58, &ps);
+            if (ps >= 100 && ps <= 200 && !freshBS) freshBS = o;
+        }
+        else if (wcscmp(nb, L"FinishSpawningActor") == 0) {
+            SafeRead32((uintptr_t)o + 0x58, &ps);
+            if (ps >= 100 && ps <= 200 && !freshFS) freshFS = o;
+        }
+        else if (wcscmp(nb, L"K2_SetActorLocation") == 0) {
+            SafeRead32((uintptr_t)o + 0x58, &ps);
+            if (ps >= 200 && !freshSL) freshSL = o;
+        }
+        else if (wcscmp(nb, L"UserConstructionScript") == 0) {
+            SafeRead32((uintptr_t)o + 0x58, &ps);
+            void* ou = GetObjOuter(o);
+            if (ou) { GetObjectName(ou, ob, 256); if (wcsstr(ob, L"SanctifiedAnvil")) freshCS = o; }
+            if (ps <= 16 && !freshCS) freshCS = o;
+        }
+        else if (wcscmp(nb, L"ReceiveBeginPlay") == 0) {
+            SafeRead32((uintptr_t)o + 0x58, &ps);
+            void* ou = GetObjOuter(o);
+            if (ou) { GetObjectName(ou, ob, 256); if (wcsstr(ob, L"SanctifiedAnvil")) freshBP = o; }
+            if (ps <= 16 && !freshBP) freshBP = o;
+        }
+        else if (wcscmp(nb, L"Default__GameplayStatics") == 0) { if (!freshCDO) freshCDO = o; }
+        else if (wcscmp(nb, L"SetSanctifiedAnvil") == 0) {
+            SafeRead32((uintptr_t)o + 0x58, &ps);
+            if (ps >= 4 && ps <= 16 && !ssaFunc) ssaFunc = o;
+        }
+        else if (wcscmp(nb, L"EnableSanctifiedAnvil") == 0) {
+            SafeRead32((uintptr_t)o + 0x58, &ps);
+            if (ps >= 100 && !esaFunc) esaFunc = o;
+        }
+
+        if (wcsncmp(nb, L"Default__", 9) == 0) continue;
+
+        void* c = GetObjClass(o); if (!c) continue;
+        if (!GetObjectName(c, cb, 256)) continue;
+
+        if (!anvilClass && (wcscmp(cb, L"BlueprintGeneratedClass") == 0 || wcscmp(cb, L"Class") == 0)
+            && wcscmp(nb, L"BP_SanctifiedAnvil_C") == 0) anvilClass = o;
+
+        if (!world && wcscmp(cb, L"World") == 0 && (wcsstr(nb, L"RogueLite") || wcsstr(nb, L"Mission")))
+            world = o;
+
+        if (wcscmp(cb, L"BP_Fabricator_C") == 0 && fabCount < 32)
+            fabInstances[fabCount++] = o;
+
+        if (!gmInst && wcsstr(cb, L"GameMode") && (wcsstr(cb, L"Dungeon") || wcsstr(cb, L"RogueLite")))
+            gmInst = o;
+        if (!srmInst && wcsstr(cb, L"EncounterManager") && wcsstr(cb, L"SafeRoom"))
+            srmInst = o;
+        if (!gsInst && wcsstr(cb, L"GameState") && wcsstr(cb, L"RogueLite"))
+            gsInst = o;
+        if (!pscInst && wcsstr(cb, L"ValPlayerSanctifyComponent") && !wcsstr(nb, L"GEN_VARIABLE"))
+            pscInst = o;
+    }
+
+    uintptr_t freshPE = 0;
+    if (freshCDO) {
+        uintptr_t vt = 0; SafeRead64((uintptr_t)freshCDO, &vt);
+        if (vt) { uintptr_t fa = 0; SafeRead64(vt + PROCESS_EVENT_VTABLE_SLOT * 8, &fa);
+            if (fa >= gTextStart && fa < gTextStart + gTextSize) freshPE = fa; }
+    }
+
+    Log("Anvil=%s World=%s BS=%s FS=%s PE=%s Fabs=%d\n",
+        anvilClass?"OK":"NO", world?"OK":"NO", freshBS?"OK":"NO", freshFS?"OK":"NO",
+        freshPE?"OK":"NO", fabCount);
+
+    if (!anvilClass || !world || !freshBS || !freshFS || !freshCDO || !freshPE) {
+        Log("Missing critical objects — not ready\n"); return 0;
+    }
+
+    int sc = 0;
+    for (int fi = 0; fi < fabCount && sc < 32; fi++) {
+        double fx, fy, fz;
+        if (GetActorLoc(fabInstances[fi], &fx, &fy, &fz)) {
+            gSpawnReq.spawnX[sc] = fx - 576.8;
+            gSpawnReq.spawnY[sc] = fy + 35.5;
+            gSpawnReq.spawnZ[sc] = fz - 123.1;
+            sc++;
+        }
+    }
+    if (sc == 0) {
+        if (requireFabricators) { Log("No fabricators loaded yet — not ready\n"); return 0; }
+        double px, py, pz;
+        if (GetPlayerLoc(&px, &py, &pz)) {
+            gSpawnReq.spawnX[0] = px + 300; gSpawnReq.spawnY[0] = py; gSpawnReq.spawnZ[0] = pz; sc = 1;
+        }
+    }
+    gSpawnReq.spawnCount = sc;
+
+    gSpawnReq.bpAnvilClass = anvilClass;
+    gSpawnReq.gameWorld = world;
+    gSpawnReq.spawnFunc = freshBS;
+    gSpawnReq.finishSpawnFunc = freshFS;
+    gSpawnReq.gameplayStaticsCDO = freshCDO;
+    gSpawnReq.processEventAddr = freshPE;
+    gSpawnReq.setLocFunc = freshSL;
+    gSpawnReq.constructionFunc = freshCS;
+    gSpawnReq.beginPlayFunc = freshBP;
+    gSpawnReq.rerunConstructionFunc = nullptr;
+    gSpawnReq.setSanctifiedAnvilFunc = ssaFunc;
+    gSpawnReq.gameModeInstance = gmInst;
+    gSpawnReq.enableSAFunc = esaFunc;
+    gSpawnReq.safeRoomMgr = srmInst;
+    gSpawnReq.gameStateInst = gsInst;
+    gSpawnReq.playerSanctifyComp = pscInst;
+
+    Log("Spawning %d anvils...\n", sc);
+    gSpawnReq.resultReady = false;
+    gSpawnReq.success = false;
+
+    TickHook::Uninstall();
+    if (!TickHook::Install(0)) { Log("FAILED to install window timer!\n"); return 1; }
+
+    TickHook::QueueOnGameThread(GameThreadSpawn);
+    for (int w = 0; w < 100 && !gSpawnReq.resultReady; w++) Sleep(50);
+    if (gSpawnReq.success) Log("*** ANVIL VISIBLE! ***\n");
+    else Log("Spawn may have failed\n");
+    return 1;
+}
+
+// Add the SanctityToken vial widget to the live HUD. Returns 0 = not ready (retry),
+// 1 = added, 2 = already present (skip).
+static int DoAddVials() {
+    Log("=== ADD VIALS ===\n");
+    SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
+    SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
+
+    if (SanctityWidgetPresent()) { Log("SanctityToken widget already present — skip\n"); return 2; }
+
+    uint8_t currencyId[16] = {};
+    bool haveId = BuildSanctityCurrencyId(currencyId);
+    if (!haveId && gSanctityCurrencyIdValid) { memcpy(currencyId, gSanctityCurrencyId, 16); haveId = true; }
+    if (!haveId) { Log("could not resolve SanctityToken CurrencyId\n"); return 0; }
+    if (!gProcessEventAddr) { Log("ProcessEvent not available\n"); return 0; }
+
+    void* addCurrFunc = nullptr;
+    void* container = nullptr;
+    wchar_t nb[256], cb[256], ob[256];
+    for (int i = 0; i < gNumElements; i++) {
+        void* o = GetUObject(i); if (!o) continue;
+        if (!GetObjectName(o, nb, 256)) continue;
+        if (!addCurrFunc && wcscmp(nb, L"AddCurrencyWidget") == 0) {
+            void* ou = GetObjOuter(o);
+            if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"WBP_Game_Currencies_C"))
+                addCurrFunc = o;
+        }
+        if (IsCDO(o)) continue;
+        void* c = GetObjClass(o); if (!c) continue;
+        if (!GetObjectName(c, cb, 256)) continue;
+        if (!container && wcscmp(cb, L"WBP_Game_Currencies_C") == 0 && wcscmp(nb, L"Currencies") == 0) {
+            void* ou = GetObjOuter(o);
+            void* ouou = ou ? GetObjOuter(ou) : nullptr;
+            if (ouou && GetObjectName(ouou, ob, 256) && wcsstr(ob, L"UI_Game_Visor_C")) container = o;
+        }
+    }
+
+    if (!addCurrFunc || !container) { Log("HUD container/func not ready (addFn=%s cont=%s)\n",
+        addCurrFunc?"OK":"NO", container?"OK":"NO"); return 0; }
+
+    gAddReq.container = container;
+    gAddReq.addCurrencyWidgetFunc = addCurrFunc;
+    gAddReq.processEventAddr = gProcessEventAddr;
+    memcpy(gAddReq.currencyId, currencyId, 16);
+    gAddReq.done = false; gAddReq.success = false;
+
+    TickHook::Uninstall();
+    if (!TickHook::Install(0)) { Log("tick hook install failed\n"); return 0; }
+    TickHook::QueueOnGameThread(GameThreadAddCurrency);
+    for (int w = 0; w < 100 && !gAddReq.done; w++) Sleep(50);
+    Log(gAddReq.success ? "vial added OK\n" : "vial add failed\n");
+    return gAddReq.success ? 1 : 0;
+}
+
+// ============================================================
 // Main thread
 // ============================================================
 
@@ -769,161 +1018,71 @@ static DWORD WINAPI ModThreadProc(LPVOID) {
 idle:
     while (gRunning) {
         Sleep(100);
+
+        // ---- AUTO: spawn anvils + add vials on each new level load (zones 1-3) ----
+        // Runs regardless of window focus, throttled to ~1s. Detects a new gameplay
+        // World, waits ~3s for it to settle, skips zone 4 (native), and otherwise
+        // applies anvils + vials once per world. Manual F9/F12 remain as fallback.
+        if (gObjArrayBase) {
+            static void* autoWorld = nullptr;
+            static bool  autoAnvilsDone = false;
+            static bool  autoVialsDone = false;
+            static bool  autoSkipZone4 = false;
+            static int   autoAttempts = 0;
+            static DWORD autoFirstSeen = 0;
+            static DWORD autoNextScan = 0;
+
+            DWORD now = GetTickCount();
+            if ((int)(now - autoNextScan) >= 0) {
+                autoNextScan = now + 1000; // throttle full scans to ~1s
+
+                SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
+                SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
+
+                void* w = FindCurrentWorld();
+                if (w != autoWorld) {
+                    autoWorld = w;
+                    autoAnvilsDone = autoVialsDone = autoSkipZone4 = false;
+                    autoAttempts = 0;
+                    autoFirstSeen = now;
+                    if (w) Log("[Auto] New world 0x%llX — will apply after settle\n", (uintptr_t)w);
+                    else   Log("[Auto] No gameplay world (menu/loading)\n");
+                }
+
+                if (autoWorld && !autoSkipZone4 && !(autoAnvilsDone && autoVialsDone)
+                    && (int)(now - autoFirstSeen) >= 3000) {
+
+                    if (IsZone4Native()) {
+                        autoSkipZone4 = true;
+                        Log("[Auto] Zone 4 (native sanctify) — skipping auto spawn/vials\n");
+                    } else {
+                        autoAttempts++;
+                        if (!autoAnvilsDone) {
+                            int r = DoSpawnAnvils(true); // wait for fabricators, no player fallback
+                            if (r == 1) { autoAnvilsDone = true; Log("[Auto] Anvils done\n"); }
+                        }
+                        if (!autoVialsDone) {
+                            int r = DoAddVials();
+                            if (r != 0) { autoVialsDone = true; Log("[Auto] Vials done (r=%d)\n", r); }
+                        }
+                        if (autoAttempts >= 20 && !(autoAnvilsDone && autoVialsDone)) {
+                            Log("[Auto] Gave up after %d attempts (anvils=%d vials=%d)\n",
+                                autoAttempts, autoAnvilsDone?1:0, autoVialsDone?1:0);
+                            autoAnvilsDone = autoVialsDone = true;
+                        }
+                    }
+                }
+            }
+        }
+
         HWND fg = GetForegroundWindow();
         if (!fg) continue;
         char wc[64] = {}; GetClassNameA(fg, wc, 64);
         if (strcmp(wc, "UnrealWindow") != 0) continue;
 
         if (IsKeyJustPressed(VK_F9) && gProcessEventAddr && gBeginSpawnFunc) {
-            Log("=== F9: SPAWN ===\n");
-            SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
-            SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
-
-            // === SINGLE PASS: find everything in one loop ===
-            void* anvilClass = nullptr;
-            void* world = nullptr;
-            void* freshBS = nullptr, *freshFS = nullptr, *freshSL = nullptr;
-            void* freshCS = nullptr, *freshBP = nullptr, *freshCDO = nullptr;
-            void* ssaFunc = nullptr, *esaFunc = nullptr;
-            void* gmInst = nullptr, *srmInst = nullptr, *gsInst = nullptr, *pscInst = nullptr;
-            void* fabInstances[32] = {}; int fabCount = 0;
-            wchar_t nb[256], cb[256], ob[256];
-
-            for (int i = 0; i < gNumElements; i++) {
-                void* o = GetUObject(i); if (!o) continue;
-                if (!GetObjectName(o, nb, 256)) continue;
-
-                // UFunctions (check by name, verify by PropsSize)
-                int32_t ps = 0;
-                if (wcscmp(nb, L"BeginDeferredActorSpawnFromClass") == 0) {
-                    SafeRead32((uintptr_t)o + 0x58, &ps);
-                    if (ps >= 100 && ps <= 200 && !freshBS) freshBS = o;
-                }
-                else if (wcscmp(nb, L"FinishSpawningActor") == 0) {
-                    SafeRead32((uintptr_t)o + 0x58, &ps);
-                    if (ps >= 100 && ps <= 200 && !freshFS) freshFS = o;
-                }
-                else if (wcscmp(nb, L"K2_SetActorLocation") == 0) {
-                    SafeRead32((uintptr_t)o + 0x58, &ps);
-                    if (ps >= 200 && !freshSL) freshSL = o;
-                }
-                else if (wcscmp(nb, L"UserConstructionScript") == 0) {
-                    SafeRead32((uintptr_t)o + 0x58, &ps);
-                    void* ou = GetObjOuter(o);
-                    if (ou) { GetObjectName(ou, ob, 256); if (wcsstr(ob, L"SanctifiedAnvil")) freshCS = o; }
-                    if (ps <= 16 && !freshCS) freshCS = o;
-                }
-                else if (wcscmp(nb, L"ReceiveBeginPlay") == 0) {
-                    SafeRead32((uintptr_t)o + 0x58, &ps);
-                    void* ou = GetObjOuter(o);
-                    if (ou) { GetObjectName(ou, ob, 256); if (wcsstr(ob, L"SanctifiedAnvil")) freshBP = o; }
-                    if (ps <= 16 && !freshBP) freshBP = o;
-                }
-                else if (wcscmp(nb, L"Default__GameplayStatics") == 0) { if (!freshCDO) freshCDO = o; }
-                else if (wcscmp(nb, L"SetSanctifiedAnvil") == 0) {
-                    SafeRead32((uintptr_t)o + 0x58, &ps);
-                    if (ps >= 4 && ps <= 16 && !ssaFunc) ssaFunc = o;
-                }
-                else if (wcscmp(nb, L"EnableSanctifiedAnvil") == 0) {
-                    SafeRead32((uintptr_t)o + 0x58, &ps);
-                    if (ps >= 100 && !esaFunc) esaFunc = o;
-                }
-
-                // Skip CDOs for instance searches
-                if (wcsncmp(nb, L"Default__", 9) == 0) continue;
-
-                // Classes and instances (check class name)
-                void* c = GetObjClass(o); if (!c) continue;
-                if (!GetObjectName(c, cb, 256)) continue;
-
-                if (!anvilClass && (wcscmp(cb, L"BlueprintGeneratedClass") == 0 || wcscmp(cb, L"Class") == 0)
-                    && wcscmp(nb, L"BP_SanctifiedAnvil_C") == 0) anvilClass = o;
-
-                if (!world && wcscmp(cb, L"World") == 0 && (wcsstr(nb, L"RogueLite") || wcsstr(nb, L"Mission")))
-                    world = o;
-
-                if (wcscmp(cb, L"BP_Fabricator_C") == 0 && fabCount < 32)
-                    fabInstances[fabCount++] = o;
-
-                if (!gmInst && wcsstr(cb, L"GameMode") && (wcsstr(cb, L"Dungeon") || wcsstr(cb, L"RogueLite")))
-                    gmInst = o;
-                if (!srmInst && wcsstr(cb, L"EncounterManager") && wcsstr(cb, L"SafeRoom"))
-                    srmInst = o;
-                if (!gsInst && wcsstr(cb, L"GameState") && wcsstr(cb, L"RogueLite"))
-                    gsInst = o;
-                if (!pscInst && wcsstr(cb, L"ValPlayerSanctifyComponent") && !wcsstr(nb, L"GEN_VARIABLE"))
-                    pscInst = o;
-            }
-
-            // ProcessEvent from CDO vtable
-            uintptr_t freshPE = 0;
-            if (freshCDO) {
-                uintptr_t vt = 0; SafeRead64((uintptr_t)freshCDO, &vt);
-                if (vt) { uintptr_t fa = 0; SafeRead64(vt + PROCESS_EVENT_VTABLE_SLOT * 8, &fa);
-                    if (fa >= gTextStart && fa < gTextStart + gTextSize) freshPE = fa; }
-            }
-
-            Log("Anvil=%s World=%s BS=%s FS=%s PE=%s Fabs=%d\n",
-                anvilClass?"OK":"NO", world?"OK":"NO", freshBS?"OK":"NO", freshFS?"OK":"NO",
-                freshPE?"OK":"NO", fabCount);
-
-            if (!anvilClass || !world || !freshBS || !freshFS || !freshCDO || !freshPE) {
-                Log("Missing critical objects\n"); continue;
-            }
-
-            // Get fabricator positions via ProcessEvent (fast — only fabCount calls)
-            int sc = 0;
-            for (int fi = 0; fi < fabCount && sc < 32; fi++) {
-                double fx, fy, fz;
-                if (GetActorLoc(fabInstances[fi], &fx, &fy, &fz)) {
-                    gSpawnReq.spawnX[sc] = fx - 576.8;
-                    gSpawnReq.spawnY[sc] = fy + 35.5;
-                    gSpawnReq.spawnZ[sc] = fz - 123.1;
-                    sc++;
-                }
-            }
-            if (sc == 0) {
-                double px, py, pz;
-                if (GetPlayerLoc(&px, &py, &pz)) {
-                    gSpawnReq.spawnX[0] = px + 300; gSpawnReq.spawnY[0] = py; gSpawnReq.spawnZ[0] = pz; sc = 1;
-                }
-            }
-            gSpawnReq.spawnCount = sc;
-
-            // Set all spawn request fields
-            gSpawnReq.bpAnvilClass = anvilClass;
-            gSpawnReq.gameWorld = world;
-            gSpawnReq.spawnFunc = freshBS;
-            gSpawnReq.finishSpawnFunc = freshFS;
-            gSpawnReq.gameplayStaticsCDO = freshCDO;
-            gSpawnReq.processEventAddr = freshPE;
-            gSpawnReq.setLocFunc = freshSL;
-            gSpawnReq.constructionFunc = freshCS;
-            gSpawnReq.beginPlayFunc = freshBP;
-            gSpawnReq.rerunConstructionFunc = nullptr;
-            gSpawnReq.setSanctifiedAnvilFunc = ssaFunc;
-            gSpawnReq.gameModeInstance = gmInst;
-            gSpawnReq.enableSAFunc = esaFunc;
-            gSpawnReq.safeRoomMgr = srmInst;
-            gSpawnReq.gameStateInst = gsInst;
-            gSpawnReq.playerSanctifyComp = pscInst;
-
-            Log("Spawning %d anvils...\n", sc);
-            gSpawnReq.resultReady = false;
-            gSpawnReq.success = false;
-
-            // Install window timer (the ONLY method proven to produce visible actors)
-            TickHook::Uninstall(); // Clean up any previous timer
-            if (!TickHook::Install(0)) {
-                Log("FAILED to install window timer!\n");
-                continue;
-            }
-
-            TickHook::QueueOnGameThread(GameThreadSpawn);
-
-            for (int w = 0; w < 100 && !gSpawnReq.resultReady; w++) Sleep(50);
-            if (gSpawnReq.success) Log("*** ANVIL VISIBLE! ***\n");
-            else Log("Spawn may have failed\n");
+            Log("=== F9: SPAWN (manual) ===\n");
+            DoSpawnAnvils(false); // manual: fall back to player position if no fabricators
         }
 
         if (IsKeyJustPressed(VK_F10) && gProcessEventAddr && gGetLocFunc) {
@@ -1767,72 +1926,8 @@ idle:
         // WBP_Game_Currencies_C container so the game draws + auto-binds the vial widget.
         // Self-sufficient: rebuilds the CurrencyId by name — no zone-4 visit / F11 needed.
         if (IsKeyJustPressed(VK_F12)) {
-            SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
-            SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
-            Log("\n=== F12: ADD CURRENCY WIDGET ===\n");
-
-            // Rebuild the CurrencyId from names; fall back to an F11-harvested cache.
-            uint8_t currencyId[16] = {};
-            bool haveId = BuildSanctityCurrencyId(currencyId);
-            if (!haveId && gSanctityCurrencyIdValid) {
-                memcpy(currencyId, gSanctityCurrencyId, 16); haveId = true;
-                Log("F12: name lookup failed — using F11-harvested cache\n");
-            }
-
-            if (!haveId) {
-                Log("F12: could not resolve SanctityToken CurrencyId (asset not loaded?)\n");
-            } else if (!gProcessEventAddr) {
-                Log("F12: ProcessEvent not available\n");
-            } else {
-                void* addCurrFunc = nullptr;
-                void* container = nullptr;
-                wchar_t nb[256], cb[256], ob[256];
-                for (int i = 0; i < gNumElements; i++) {
-                    void* o = GetUObject(i); if (!o) continue;
-                    if (!GetObjectName(o, nb, 256)) continue;
-                    if (!addCurrFunc && wcscmp(nb, L"AddCurrencyWidget") == 0) {
-                        void* ou = GetObjOuter(o);
-                        if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"WBP_Game_Currencies_C"))
-                            addCurrFunc = o;
-                    }
-                    if (IsCDO(o)) continue;
-                    void* c = GetObjClass(o); if (!c) continue;
-                    if (!GetObjectName(c, cb, 256)) continue;
-                    // Live container inside the active visor HUD
-                    if (!container && wcscmp(cb, L"WBP_Game_Currencies_C") == 0 && wcscmp(nb, L"Currencies") == 0) {
-                        void* ou = GetObjOuter(o);              // WidgetTree
-                        void* ouou = ou ? GetObjOuter(ou) : nullptr; // UserWidget
-                        if (ouou && GetObjectName(ouou, ob, 256) && wcsstr(ob, L"UI_Game_Visor_C")) {
-                            container = o;
-                            Log("Container: 0x%llX (outer->%ls)\n", (uintptr_t)o, ob);
-                        }
-                    }
-                }
-
-                wchar_t ts[256] = L"", ns[256] = L"";
-                FName tN, nN;
-                memcpy(&tN, currencyId + 0, 8); memcpy(&nN, currencyId + 8, 8);
-                GetFNameStr(&tN, ts, 256); GetFNameStr(&nN, ns, 256);
-                Log("CurrencyId type=\"%ls\" name=\"%ls\"\n", ts, ns);
-                Log("AddCurrencyWidget=%s Container=%s\n", addCurrFunc?"OK":"NO", container?"OK":"NO");
-
-                if (addCurrFunc && container) {
-                    gAddReq.container = container;
-                    gAddReq.addCurrencyWidgetFunc = addCurrFunc;
-                    gAddReq.processEventAddr = gProcessEventAddr;
-                    memcpy(gAddReq.currencyId, currencyId, 16);
-                    gAddReq.done = false; gAddReq.success = false;
-
-                    TickHook::Uninstall();
-                    if (TickHook::Install(0)) {
-                        TickHook::QueueOnGameThread(GameThreadAddCurrency);
-                        for (int w = 0; w < 100 && !gAddReq.done; w++) Sleep(50);
-                        Log(gAddReq.success ? "=== F12 SUCCEEDED ===\n\n" : "=== F12 FAILED ===\n\n");
-                    } else Log("F12: tick hook install failed\n");
-                } else {
-                    Log("F12: missing container or function — not in a zone with the HUD?\n");
-                }
-            }
+            Log("\n=== F12: ADD CURRENCY WIDGET (manual) ===\n");
+            DoAddVials();
         }
     }
     return 0;

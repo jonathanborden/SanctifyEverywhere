@@ -64,6 +64,7 @@ bool GetObjectName(void* obj, wchar_t* buf, int bufSize);
 void* GetObjClass(void* obj);
 void* GetObjOuter(void* obj);
 bool IsCDO(void* obj);
+static bool GetFNameStr(const FName* n, wchar_t* buf, int sz);
 
 // ============================================================
 // Spawn request (background thread -> game thread)
@@ -223,6 +224,33 @@ static void GameThreadAddCurrency() {
         Log("[GT-Add] AddCurrencyWidget CRASHED\n");
     }
     gAddReq.done = true;
+}
+
+// Find an FName by locating any loaded UObject whose name resolves to `target`.
+// Any FName resolving to a given string shares the same ComparisonIndex, so this
+// yields the exact FName needed to rebuild an FPrimaryAssetId — no harvest required.
+static bool FindFNameByObjectName(const wchar_t* target, FName* out) {
+    wchar_t nb[256];
+    for (int i = 0; i < gNumElements; i++) {
+        void* o = GetUObject(i); if (!o || !IsSafeToRead(o, 0x20)) continue;
+        FName n;
+        if (!SafeRead32((uintptr_t)o + 0x18, &n.ComparisonIndex)) continue;
+        if (!SafeRead32((uintptr_t)o + 0x1C, &n.Number)) continue;
+        if (!GetFNameStr(&n, nb, 256)) continue;
+        if (wcscmp(nb, target) == 0) { *out = n; return true; }
+    }
+    return false;
+}
+
+// Rebuild the SanctityToken FPrimaryAssetId = {type FName, name FName} from names.
+static bool BuildSanctityCurrencyId(uint8_t out[16]) {
+    FName typeName, assetName;
+    if (!FindFNameByObjectName(L"ValItemAsset", &typeName)) return false;
+    if (!FindFNameByObjectName(L"Item_Currency_SanctityToken", &assetName)) return false;
+    memset(out, 0, 16);
+    memcpy(out + 0, &typeName, 8);
+    memcpy(out + 8, &assetName, 8);
+    return true;
 }
 
 static void SpawnOneAnvil(ProcessEvent_fn pe, double sx, double sy, double sz) {
@@ -1735,15 +1763,24 @@ idle:
             Log("=== F11 DONE ===\n\n");
         }
 
-        // F12: in the CURRENT zone, call AddCurrencyWidget(cachedId) on the live
+        // F12: in the CURRENT zone, call AddCurrencyWidget(SanctityToken) on the live
         // WBP_Game_Currencies_C container so the game draws + auto-binds the vial widget.
+        // Self-sufficient: rebuilds the CurrencyId by name — no zone-4 visit / F11 needed.
         if (IsKeyJustPressed(VK_F12)) {
             SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
             SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
             Log("\n=== F12: ADD CURRENCY WIDGET ===\n");
 
-            if (!gSanctityCurrencyIdValid) {
-                Log("F12: no cached CurrencyId — press F11 in zone 4 first (same game session)\n");
+            // Rebuild the CurrencyId from names; fall back to an F11-harvested cache.
+            uint8_t currencyId[16] = {};
+            bool haveId = BuildSanctityCurrencyId(currencyId);
+            if (!haveId && gSanctityCurrencyIdValid) {
+                memcpy(currencyId, gSanctityCurrencyId, 16); haveId = true;
+                Log("F12: name lookup failed — using F11-harvested cache\n");
+            }
+
+            if (!haveId) {
+                Log("F12: could not resolve SanctityToken CurrencyId (asset not loaded?)\n");
             } else if (!gProcessEventAddr) {
                 Log("F12: ProcessEvent not available\n");
             } else {
@@ -1774,16 +1811,16 @@ idle:
 
                 wchar_t ts[256] = L"", ns[256] = L"";
                 FName tN, nN;
-                memcpy(&tN, gSanctityCurrencyId + 0, 8); memcpy(&nN, gSanctityCurrencyId + 8, 8);
+                memcpy(&tN, currencyId + 0, 8); memcpy(&nN, currencyId + 8, 8);
                 GetFNameStr(&tN, ts, 256); GetFNameStr(&nN, ns, 256);
-                Log("Using cached CurrencyId type=\"%ls\" name=\"%ls\"\n", ts, ns);
+                Log("CurrencyId type=\"%ls\" name=\"%ls\"\n", ts, ns);
                 Log("AddCurrencyWidget=%s Container=%s\n", addCurrFunc?"OK":"NO", container?"OK":"NO");
 
                 if (addCurrFunc && container) {
                     gAddReq.container = container;
                     gAddReq.addCurrencyWidgetFunc = addCurrFunc;
                     gAddReq.processEventAddr = gProcessEventAddr;
-                    memcpy(gAddReq.currencyId, gSanctityCurrencyId, 16);
+                    memcpy(gAddReq.currencyId, currencyId, 16);
                     gAddReq.done = false; gAddReq.success = false;
 
                     TickHook::Uninstall();

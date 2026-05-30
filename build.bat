@@ -11,7 +11,7 @@ if not exist build mkdir build
 
 cl.exe /nologo /O2 /LD /EHsc /std:c++17 ^
     /Isrc ^
-    src\dllmain.cpp src\proxy.cpp src\mod.cpp ^
+    src\dllmain.cpp src\proxy.cpp src\mod.cpp src\tick_hook.cpp ^
     /Fe:build\dwmapi.dll ^
     /link /DLL /DEF:src\dwmapi.def ^
     user32.lib kernel32.lib

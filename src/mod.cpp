@@ -3,7 +3,6 @@
 #include <cstdio>
 #include <atomic>
 #include <cstring>
-#include <cmath>
 
 // ============================================================
 // Globals
@@ -29,14 +28,9 @@ uintptr_t gExeBase = 0, gExeEnd = 0;
 static uintptr_t gProcessEventAddr = 0;
 static FNameToString_fn gFNameToString = nullptr;
 
-// Cached UFunction/object pointers (found once per session)
-static void* gBeginSpawnFunc = nullptr;
-static void* gFinishSpawnFunc = nullptr;
+// Cached pointers needed by the auto path (found once at startup).
+// K2_GetActorLocation is reused every frame to read fabricator positions.
 static void* gGetLocFunc = nullptr;
-static void* gSetLocFunc = nullptr;
-static void* gConstructionFunc = nullptr;
-static void* gBeginPlayFunc = nullptr;
-static void* gGameplayStaticsCDO = nullptr;
 
 // ============================================================
 // Constants (Deadzone Rogue v1.4 - stable across ASLR)
@@ -95,112 +89,8 @@ static struct {
 } gSpawnReq = {};
 
 // ============================================================
-// Currency HUD experiment (F6) — game thread callback
+// Vial HUD widget — AddCurrencyWidget on the live HUD container
 // ============================================================
-
-static struct {
-    void* visorCurrenciesWidget;    // WBP_Game_Currencies_C inside UI_Game_Visor_C
-    void* setVisibilityFunc;
-    void* onMechanicsUpdatedFunc;   // OnAvailableRunProgressionMechanicsUpdated
-    void* addCurrencyWidgetFunc;
-    void* setCurrencyIdFunc;
-    void* bindCurrencyFunc;
-    void* playerStateInst;
-    void* getMatchCurrencyFunc;
-    uintptr_t processEventAddr;
-    volatile bool done;
-    volatile bool success;
-} gCurrReq = {};
-
-static void GameThreadCurrencyExperiment() {
-    ProcessEvent_fn pe = (ProcessEvent_fn)gCurrReq.processEventAddr;
-    void* w = gCurrReq.visorCurrenciesWidget;
-
-    // Step 1: SetVisibility(Visible=0) on the Currencies container
-    if (gCurrReq.setVisibilityFunc && w) {
-        __declspec(align(16)) uint8_t vp[16] = {};
-        // ESlateVisibility: 0=Visible, 1=Collapsed, 2=Hidden, 3=HitTestInvisible, 4=SelfHitTestInvisible
-        vp[0] = 0; // Visible
-        __try {
-            pe(w, gCurrReq.setVisibilityFunc, vp);
-            Log("[GT-Curr] SetVisibility(Visible) OK\n");
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            Log("[GT-Curr] SetVisibility CRASHED\n");
-        }
-    }
-
-    // Step 2: Call OnAvailableRunProgressionMechanicsUpdated with zeroed params
-    if (gCurrReq.onMechanicsUpdatedFunc && w) {
-        __declspec(align(16)) uint8_t mp[16] = {};
-        __try {
-            pe(w, gCurrReq.onMechanicsUpdatedFunc, mp);
-            Log("[GT-Curr] OnAvailableRunProgressionMechanicsUpdated(zeroed) OK\n");
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            Log("[GT-Curr] OnAvailableRunProgressionMechanicsUpdated CRASHED\n");
-        }
-    }
-
-    // Step 3: Try OnAvailableRunProgressionMechanicsUpdated with flags=0xFF
-    if (gCurrReq.onMechanicsUpdatedFunc && w) {
-        __declspec(align(16)) uint8_t mp[16] = {};
-        mp[0] = 0xFF; // All flags set
-        __try {
-            pe(w, gCurrReq.onMechanicsUpdatedFunc, mp);
-            Log("[GT-Curr] OnAvailableRunProgressionMechanicsUpdated(0xFF) OK\n");
-        } __except(EXCEPTION_EXECUTE_HANDLER) {
-            Log("[GT-Curr] OnAvailableRunProgressionMechanicsUpdated(0xFF) CRASHED\n");
-        }
-    }
-
-    // Step 4: Read currency after experiment
-    if (gCurrReq.getMatchCurrencyFunc && gCurrReq.playerStateInst) {
-        __declspec(align(16)) uint8_t cp[16] = {};
-        __try {
-            pe(gCurrReq.playerStateInst, gCurrReq.getMatchCurrencyFunc, cp);
-            Log("[GT-Curr] GetMatchCurrency = %d\n", *(int32_t*)cp);
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
-    }
-
-    // Step 5: Dump child widgets of the CurrencyGroup to see if entries were added
-    // Find CurrencyGroup (HorizontalBox) by scanning objects whose outer is the same WidgetTree
-    // as the Currencies widget
-    void* currOuter = nullptr;
-    if (w) {
-        uintptr_t outerPtr = 0;
-        SafeRead64((uintptr_t)w + 0x20, &outerPtr);
-        currOuter = (void*)outerPtr;
-    }
-    if (currOuter) {
-        wchar_t nb[256], cb[256];
-        int32_t ne = 0;
-        SafeRead32((uintptr_t)gObjArrayBase + 0x14, &ne);
-        Log("[GT-Curr] Scanning for children of same WidgetTree (outer=0x%llX)...\n", (uintptr_t)currOuter);
-        for (int i = 0; i < ne; i++) {
-            void* o = GetUObject(i); if (!o) continue;
-            void* oo = GetObjOuter(o);
-            if (oo != currOuter) continue;
-            if (!GetObjectName(o, nb, 256)) continue;
-            void* c = GetObjClass(o);
-            cb[0] = 0; if (c) GetObjectName(c, cb, 256);
-            if (wcsstr(cb, L"Currency") || wcsstr(nb, L"Currency") || wcsstr(cb, L"HorizontalBox"))
-                Log("[GT-Curr]   child: \"%ls\" class=\"%ls\" (0x%llX)\n", nb, cb, (uintptr_t)o);
-        }
-    }
-
-    Log("[GT-Curr] *** EXPERIMENT COMPLETE ***\n");
-    gCurrReq.success = true;
-    gCurrReq.done = true;
-}
-
-// ============================================================
-// Direct AddCurrencyWidget (F11 harvest / F12 call)
-// ============================================================
-
-// Harvested SanctityToken FPrimaryAssetId (16B: type FName[8] + name FName[8]).
-// Persists for the process lifetime — FName indices are process-global, so an ID
-// harvested in zone 4 stays valid for an F12 call in a later zone-1-3 run (no restart).
-static uint8_t gSanctityCurrencyId[16] = {};
-static bool gSanctityCurrencyIdValid = false;
 
 static struct {
     void* container;             // live WBP_Game_Currencies_C
@@ -452,15 +342,6 @@ bool IsCDO(void* o) {
     wchar_t n[256]; return GetObjectName(o, n, 256) && wcsncmp(n, L"Default__", 9) == 0;
 }
 
-// Case-insensitive substring (needle must be lowercase ASCII).
-static bool ContainsCI(const wchar_t* hay, const wchar_t* needleLower) {
-    if (!hay) return false;
-    wchar_t low[256]; int i = 0;
-    for (; hay[i] && i < 255; i++) { wchar_t c = hay[i]; if (c>=L'A'&&c<=L'Z') c+=32; low[i]=c; }
-    low[i] = 0;
-    return wcsstr(low, needleLower) != nullptr;
-}
-
 // ============================================================
 // Pattern scan (only needed once per session for GUObjectArray)
 // ============================================================
@@ -540,147 +421,28 @@ found_guoa:
     return true;
 }
 
-// Find UFunction by name (returns first match with PropsSize in range)
-static void* FindUFunc(const wchar_t* name, int minPS, int maxPS) {
-    wchar_t nb[256];
-    for (int i = 0; i < gNumElements; i++) {
-        void* o = GetUObject(i); if (!o) continue;
-        if (!GetObjectName(o, nb, 256)) continue;
-        if (wcscmp(nb, name) != 0) continue;
-        int32_t ps = 0; SafeRead32((uintptr_t)o + 0x58, &ps);
-        if (ps >= minPS && ps <= maxPS) return o;
-    }
-    return nullptr;
-}
-
-// Find class by name
-static void* FindClass(const wchar_t* name) {
-    wchar_t nb[256], cb[256];
-    for (int i = 0; i < gNumElements; i++) {
-        void* o = GetUObject(i); if (!o) continue;
-        if (!GetObjectName(o, nb, 256) || wcscmp(nb, name) != 0) continue;
-        void* c = GetObjClass(o); if (!c) continue;
-        if (GetObjectName(c, cb, 256) && (wcscmp(cb, L"Class")==0 || wcscmp(cb, L"BlueprintGeneratedClass")==0))
-            return o;
-    }
-    return nullptr;
-}
-
-// ============================================================
-// Reflection dumpers — decode UStruct param chains & UEnum entries
-// UE5 offsets:
-//   UStruct: SuperStruct 0x40, Children(UField*) 0x48, ChildProperties(FField*) 0x50, PropertiesSize 0x58
-//   FField:  ClassPrivate(FFieldClass*) 0x08, Next(FField*) 0x20, NamePrivate(FName) 0x28
-//   FProperty: ArrayDim 0x38, ElementSize 0x3C, PropertyFlags(u64) 0x40, Offset_Internal 0x4C
-//   typed inner ptr (Struct/Enum/PropertyClass) 0x78
-//   FFieldClass: FName Name 0x00
-//   UEnum: Names TArray { data 0x40, count 0x48 }; entry = FName(8)+i64(8)=16B
-// ============================================================
-
-static bool GetFFieldName(void* field, wchar_t* buf, int sz) {
-    buf[0] = 0;
-    if (!field || !IsSafeToRead(field, 0x30)) return false;
-    FName n;
-    if (!SafeRead32((uintptr_t)field + 0x28, &n.ComparisonIndex)) return false;
-    if (!SafeRead32((uintptr_t)field + 0x2C, &n.Number)) return false;
-    return GetFNameStr(&n, buf, sz);
-}
-
-static bool GetFFieldClassName(void* field, wchar_t* buf, int sz) {
-    buf[0] = 0;
-    if (!field || !IsSafeToRead(field, 0x10)) return false;
-    uintptr_t fc = 0;
-    if (!SafeRead64((uintptr_t)field + 0x08, &fc) || !fc || !IsSafeToRead((void*)fc, 0x08)) return false;
-    FName n;
-    if (!SafeRead32(fc + 0x00, &n.ComparisonIndex)) return false;
-    if (!SafeRead32(fc + 0x04, &n.Number)) return false;
-    return GetFNameStr(&n, buf, sz);
-}
-
-// Walk a UStruct/UFunction's ChildProperties (FField*) chain and log each property.
-static void DumpStructProperties(void* ustruct, const wchar_t* label) {
-    if (!ustruct || !IsSafeToRead(ustruct, 0x60)) { Log("  [%ls] unreadable\n", label); return; }
-    int32_t propsSize = 0; SafeRead32((uintptr_t)ustruct + 0x58, &propsSize);
-    Log("  [%ls] PropertiesSize=%d\n", label, propsSize);
-    uintptr_t field = 0; SafeRead64((uintptr_t)ustruct + 0x50, &field);
-    int guard = 0;
-    while (field && IsSafeToRead((void*)field, 0x50) && guard++ < 64) {
-        wchar_t pname[256], ptype[256];
-        GetFFieldName((void*)field, pname, 256);
-        GetFFieldClassName((void*)field, ptype, 256);
-        int32_t arrDim = 0, elemSize = 0, off = 0;
-        uintptr_t flags = 0;
-        SafeRead32(field + 0x38, &arrDim);
-        SafeRead32(field + 0x3C, &elemSize);
-        SafeRead64(field + 0x40, &flags);
-        SafeRead32(field + 0x4C, &off);
-        // flags: Parm=0x80, OutParm=0x100, ReturnParm=0x400, ConstParm=0x200
-        char dir[32] = "";
-        if (flags & 0x400) strcpy_s(dir, "RET");
-        else if (flags & 0x100) strcpy_s(dir, "OUT");
-        else if (flags & 0x80)  strcpy_s(dir, "IN ");
-        else strcpy_s(dir, "loc");
-        // inner typed pointer (Struct/Enum/PropertyClass) at 0x78 for relevant property classes
-        wchar_t inner[256] = L"";
-        if (wcsstr(ptype, L"Struct") || wcsstr(ptype, L"Enum") || wcsstr(ptype, L"Byte") ||
-            wcsstr(ptype, L"Object") || wcsstr(ptype, L"Class") || wcsstr(ptype, L"Interface")) {
-            uintptr_t ip = 0;
-            if (SafeRead64(field + 0x78, &ip) && ip && IsSafeToRead((void*)ip, 0x20))
-                GetObjectName((void*)ip, inner, 256);
-        }
-        Log("    [%s] off=0x%-3X size=%-3d dim=%d  %-18ls %ls%s%ls\n",
-            dir, off, elemSize, arrDim, ptype, pname,
-            inner[0] ? L"  -> " : L"", inner);
-        SafeRead64(field + 0x20, &field); // Next
-    }
-}
-
-// Dump a UEnum's Names TArray (name=value pairs).
-static void DumpEnum(void* uenum) {
-    if (!uenum || !IsSafeToRead(uenum, 0x50)) { Log("  enum unreadable\n"); return; }
-    uintptr_t data = 0; int32_t count = 0;
-    SafeRead64((uintptr_t)uenum + 0x40, &data);
-    SafeRead32((uintptr_t)uenum + 0x48, &count);
-    if (!data || count <= 0 || count > 4096 || !IsSafeToRead((void*)data, (size_t)count * 16)) {
-        Log("  enum Names array invalid (data=0x%llX count=%d)\n", data, count);
-        return;
-    }
-    Log("  enum has %d entries:\n", count);
-    for (int i = 0; i < count; i++) {
-        FName n; uintptr_t val = 0;
-        SafeRead32(data + (uintptr_t)i*16 + 0, &n.ComparisonIndex);
-        SafeRead32(data + (uintptr_t)i*16 + 4, &n.Number);
-        SafeRead64(data + (uintptr_t)i*16 + 8, &val);
-        wchar_t en[256]; GetFNameStr(&n, en, 256);
-        Log("    [%lld] %ls\n", (long long)val, en);
-    }
-}
-
-// Minimal startup cache — just enough to gate F9. F9 does its own full search.
+// Minimal startup cache: resolve K2_GetActorLocation (used to read fabricator
+// positions) and ProcessEvent (via the GameplayStatics CDO vtable). DoSpawnAnvils
+// re-finds the spawn functions fresh per level load, so nothing else is cached here.
 static bool CacheObjects() {
     SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
     Log("Startup scan (%d objects)...\n", gNumElements);
 
-    // Single pass: find BeginSpawn + CDO + GetLoc (minimum needed for F9 gate)
+    void* gameplayStaticsCDO = nullptr;
     wchar_t nb[256];
     for (int i = 0; i < gNumElements; i++) {
         void* o = GetUObject(i); if (!o) continue;
         if (!GetObjectName(o, nb, 256)) continue;
-        if (!gBeginSpawnFunc && wcscmp(nb, L"BeginDeferredActorSpawnFromClass") == 0) {
-            int32_t ps = 0; SafeRead32((uintptr_t)o + 0x58, &ps);
-            if (ps >= 100 && ps <= 200) gBeginSpawnFunc = o;
-        }
         if (!gGetLocFunc && wcscmp(nb, L"K2_GetActorLocation") == 0) {
             int32_t ps = 0; SafeRead32((uintptr_t)o + 0x58, &ps);
             if (ps >= 20 && ps <= 50) gGetLocFunc = o;
         }
-        if (!gGameplayStaticsCDO && wcscmp(nb, L"Default__GameplayStatics") == 0)
-            gGameplayStaticsCDO = o;
+        if (!gameplayStaticsCDO && wcscmp(nb, L"Default__GameplayStatics") == 0)
+            gameplayStaticsCDO = o;
     }
 
-    // Find ProcessEvent
-    if (gGameplayStaticsCDO) {
-        uintptr_t vt = 0; SafeRead64((uintptr_t)gGameplayStaticsCDO, &vt);
+    if (gameplayStaticsCDO) {
+        uintptr_t vt = 0; SafeRead64((uintptr_t)gameplayStaticsCDO, &vt);
         if (vt) {
             uintptr_t fa = 0; SafeRead64(vt + PROCESS_EVENT_VTABLE_SLOT * 8, &fa);
             if (fa >= gTextStart && fa < gTextStart + gTextSize) {
@@ -691,14 +453,8 @@ static bool CacheObjects() {
         }
     }
 
-    // Don't install tick hook here - do it in F9 when we know the level window is ready
-
-    Log("Cached: BeginSpawn=%s FinishSpawn=%s GetLoc=%s SetLoc=%s Constr=%s BeginPlay=%s CDO=%s PE=%s Tick=%s\n",
-        gBeginSpawnFunc?"OK":"NO", gFinishSpawnFunc?"OK":"NO", gGetLocFunc?"OK":"NO",
-        gSetLocFunc?"OK":"NO", gConstructionFunc?"OK":"NO", gBeginPlayFunc?"OK":"NO",
-        gGameplayStaticsCDO?"OK":"NO", gProcessEventAddr?"OK":"NO", "OK");
-
-    return gBeginSpawnFunc && gFinishSpawnFunc && gGameplayStaticsCDO && gProcessEventAddr;
+    Log("Cached: GetLoc=%s PE=%s\n", gGetLocFunc?"OK":"NO", gProcessEventAddr?"OK":"NO");
+    return gGetLocFunc && gProcessEventAddr;
 }
 
 // Get actor location via ProcessEvent on any object
@@ -712,36 +468,8 @@ static bool GetActorLoc(void* actor, double* x, double* y, double* z) {
     } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-// Get player PAWN location (not controller!)
-static bool GetPlayerLoc(double* x, double* y, double* z) {
-    if (!gGetLocFunc || !gProcessEventAddr) return false;
-    wchar_t cb[256];
-    // Try pawn classes first (the actual character in the world)
-    const wchar_t* pawnClasses[] = {L"CharPlayer_Dungeon", L"CharPlayer", L"ValChar", nullptr};
-    for (int pc = 0; pawnClasses[pc]; pc++) {
-        for (int i = 0; i < gNumElements; i++) {
-            void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
-            void* c = GetObjClass(o); if (!c) continue;
-            if (!GetObjectName(c, cb, 256) || !wcsstr(cb, pawnClasses[pc])) continue;
-            if (GetActorLoc(o, x, y, z)) return true;
-        }
-    }
-    return false;
-}
-
 // ============================================================
-// Key handlers
-// ============================================================
-
-static bool IsKeyJustPressed(int vk) {
-    static bool p[256] = {};
-    bool c = (GetAsyncKeyState(vk) & 0x8000) != 0;
-    bool w = p[vk]; p[vk] = c;
-    return c && !w;
-}
-
-// ============================================================
-// Reusable actions — shared by hotkeys (F9/F12) and the auto-on-load path
+// Reusable actions — driven by the auto-on-load path
 // ============================================================
 
 static const int CURRENCY_ID_OFFSET = 0x55C; // FPrimaryAssetId in WBP_Game_Currency_C body
@@ -791,11 +519,10 @@ static bool SanctityWidgetPresent() {
 }
 
 // Spawn sanctified anvils at every fabricator. Returns 0 = not ready (retry later),
-// 1 = attempted (do not retry — avoids duplicate anvils).
-// requireFabricators: when true (auto path) don't fall back to player position; wait
-// until fabricators have loaded.
-static int DoSpawnAnvils(bool requireFabricators) {
-    Log("=== SPAWN ANVILS (requireFab=%d) ===\n", requireFabricators ? 1 : 0);
+// 1 = attempted (do not retry — avoids duplicate anvils). Waits until fabricators
+// have loaded before spawning.
+static int DoSpawnAnvils() {
+    Log("=== SPAWN ANVILS ===\n");
     SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
     SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
 
@@ -896,13 +623,7 @@ static int DoSpawnAnvils(bool requireFabricators) {
             sc++;
         }
     }
-    if (sc == 0) {
-        if (requireFabricators) { Log("No fabricators loaded yet — not ready\n"); return 0; }
-        double px, py, pz;
-        if (GetPlayerLoc(&px, &py, &pz)) {
-            gSpawnReq.spawnX[0] = px + 300; gSpawnReq.spawnY[0] = py; gSpawnReq.spawnZ[0] = pz; sc = 1;
-        }
-    }
+    if (sc == 0) { Log("No fabricators loaded yet — not ready\n"); return 0; }
     gSpawnReq.spawnCount = sc;
 
     gSpawnReq.bpAnvilClass = anvilClass;
@@ -946,9 +667,7 @@ static int DoAddVials() {
     if (SanctityWidgetPresent()) { Log("SanctityToken widget already present — skip\n"); return 2; }
 
     uint8_t currencyId[16] = {};
-    bool haveId = BuildSanctityCurrencyId(currencyId);
-    if (!haveId && gSanctityCurrencyIdValid) { memcpy(currencyId, gSanctityCurrencyId, 16); haveId = true; }
-    if (!haveId) { Log("could not resolve SanctityToken CurrencyId\n"); return 0; }
+    if (!BuildSanctityCurrencyId(currencyId)) { Log("could not resolve SanctityToken CurrencyId\n"); return 0; }
     if (!gProcessEventAddr) { Log("ProcessEvent not available\n"); return 0; }
 
     void* addCurrFunc = nullptr;
@@ -1013,7 +732,7 @@ static DWORD WINAPI ModThreadProc(LPVOID) {
     if (!InitUE()) { Log("InitUE FAILED\n"); goto idle; }
     if (!CacheObjects()) { Log("CacheObjects FAILED\n"); goto idle; }
 
-    Log("\n*** READY! Press F9 to spawn anvil, F10 to capture position ***\n\n");
+    Log("\n*** READY! Auto-spawning anvils + vials on each zone 1-3 load ***\n\n");
 
 idle:
     while (gRunning) {
@@ -1058,7 +777,7 @@ idle:
                     } else {
                         autoAttempts++;
                         if (!autoAnvilsDone) {
-                            int r = DoSpawnAnvils(true); // wait for fabricators, no player fallback
+                            int r = DoSpawnAnvils(); // waits until fabricators have loaded
                             if (r == 1) { autoAnvilsDone = true; Log("[Auto] Anvils done\n"); }
                         }
                         if (!autoVialsDone) {
@@ -1073,861 +792,6 @@ idle:
                     }
                 }
             }
-        }
-
-        HWND fg = GetForegroundWindow();
-        if (!fg) continue;
-        char wc[64] = {}; GetClassNameA(fg, wc, 64);
-        if (strcmp(wc, "UnrealWindow") != 0) continue;
-
-        if (IsKeyJustPressed(VK_F9) && gProcessEventAddr && gBeginSpawnFunc) {
-            Log("=== F9: SPAWN (manual) ===\n");
-            DoSpawnAnvils(false); // manual: fall back to player position if no fabricators
-        }
-
-        if (IsKeyJustPressed(VK_F10) && gProcessEventAddr && gGetLocFunc) {
-            SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
-            SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
-            double x, y, z;
-            if (GetPlayerLoc(&x, &y, &z))
-                Log("F10 PAWN POSITION: (%.2f, %.2f, %.2f)\n", x, y, z);
-            else
-                Log("F10: Could not get pawn position\n");
-        }
-
-        if (IsKeyJustPressed(VK_F7)) {
-            SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
-            SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
-            Log("\n=== F7: CURRENCY HUD SCAN (%d objects) ===\n", gNumElements);
-
-            void* getMatchCurrencyFunc = nullptr;
-            void* setVisibilityFunc = nullptr;
-            void* playerStateInst = nullptr;
-            void* hudInst = nullptr;
-            void* inventoryComp = nullptr;
-            void* addCurrencyWidgetFunc = nullptr;
-            void* setCurrencyIdFunc = nullptr;
-            void* bindCurrencyFunc = nullptr;
-
-            // Collect ALL Currencies widgets to find the HUD's one
-            void* currWidgets[64] = {};
-            void* currWidgetOuters[64] = {};
-            int currWidgetCount = 0;
-
-            wchar_t nb[256], cb[256], ob[256];
-            for (int i = 0; i < gNumElements; i++) {
-                void* o = GetUObject(i); if (!o) continue;
-                if (!GetObjectName(o, nb, 256)) continue;
-
-                // Functions
-                if (!getMatchCurrencyFunc && wcscmp(nb, L"GetMatchCurrency") == 0) {
-                    void* ou = GetObjOuter(o);
-                    if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"ValPlayerState"))
-                        getMatchCurrencyFunc = o;
-                }
-                if (!setVisibilityFunc && wcscmp(nb, L"SetVisibility") == 0) {
-                    int32_t ps = 0; SafeRead32((uintptr_t)o + 0x58, &ps);
-                    if (ps >= 1 && ps <= 8) {
-                        setVisibilityFunc = o;
-                        Log("SetVisibility: PS=%d\n", ps);
-                    }
-                }
-                if (!addCurrencyWidgetFunc && wcscmp(nb, L"AddCurrencyWidget") == 0) {
-                    void* ou = GetObjOuter(o);
-                    if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"WBP_Game_Currencies_C"))
-                        addCurrencyWidgetFunc = o;
-                }
-                if (!setCurrencyIdFunc && wcscmp(nb, L"SetCurrencyId") == 0) {
-                    void* ou = GetObjOuter(o);
-                    if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"WBP_Game_Currency_C"))
-                        setCurrencyIdFunc = o;
-                }
-                if (!bindCurrencyFunc && wcscmp(nb, L"BindCurrency") == 0) {
-                    void* ou = GetObjOuter(o);
-                    if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"WBP_Game_Currency_C"))
-                        bindCurrencyFunc = o;
-                }
-
-                // Log ALL functions on HUD-related classes
-                void* fOuter = GetObjOuter(o);
-                if (fOuter && GetObjectName(fOuter, ob, 256)) {
-                    void* fClass = GetObjClass(o);
-                    wchar_t fcb[256] = {};
-                    if (fClass) GetObjectName(fClass, fcb, 256);
-                    if ((wcscmp(fcb, L"Function") == 0 || wcscmp(fcb, L"DelegateFunction") == 0) &&
-                        (wcsstr(ob, L"ValHUDStateTracker") || wcsstr(ob, L"UI_HUD_Game_RH") ||
-                         wcsstr(ob, L"RHGameHUD") || wcsstr(ob, L"WBP_Game_Currencies"))) {
-                        int32_t ps = 0; SafeRead32((uintptr_t)o + 0x58, &ps);
-                        Log("  Func: \"%ls\" outer=\"%ls\" PS=%d\n", nb, ob, ps);
-                    }
-                }
-
-                if (wcsncmp(nb, L"Default__", 9) == 0) continue;
-                void* c = GetObjClass(o); if (!c) continue;
-                if (!GetObjectName(c, cb, 256)) continue;
-
-                // PlayerState
-                if (!playerStateInst && wcsstr(cb, L"ValPlayerState") && !wcsstr(cb, L"BlueprintGenerated")) {
-                    playerStateInst = o;
-                    Log("PlayerState: 0x%llX class=\"%ls\"\n", (uintptr_t)o, cb);
-                }
-
-                // HUD instance
-                if (wcsstr(cb, L"UI_HUD_Game_RH_C") && !wcsstr(cb, L"BlueprintGenerated")) {
-                    void* ou = GetObjOuter(o);
-                    if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"PersistentLevel")) {
-                        hudInst = o;
-                        Log("HUD: 0x%llX name=\"%ls\"\n", (uintptr_t)o, nb);
-                    }
-                }
-
-                // ALL Currencies widgets
-                if (wcscmp(cb, L"WBP_Game_Currencies_C") == 0 && wcscmp(nb, L"Currencies") == 0) {
-                    if (currWidgetCount < 64) {
-                        void* ou = GetObjOuter(o);
-                        currWidgets[currWidgetCount] = o;
-                        currWidgetOuters[currWidgetCount] = ou;
-                        currWidgetCount++;
-                    }
-                }
-
-                // InventoryComp on actual player controller
-                if (wcscmp(cb, L"ValInventoryComponent") == 0 && wcscmp(nb, L"InventoryComponent") == 0) {
-                    void* ou = GetObjOuter(o);
-                    if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"BP_ValPlayerController") && !wcsstr(ob, L"Default__")) {
-                        inventoryComp = o;
-                        Log("InventoryComp: 0x%llX\n", (uintptr_t)o);
-                    }
-                }
-            }
-
-            // Find which Currencies widget is inside the HUD by tracing outer chain
-            void* hudCurrenciesWidget = nullptr;
-            if (hudInst) {
-                for (int w = 0; w < currWidgetCount; w++) {
-                    // Trace: Currencies -> WidgetTree -> UserWidget (== HUD?)
-                    void* wt = currWidgetOuters[w]; // WidgetTree
-                    if (!wt) continue;
-                    void* wtOuter = GetObjOuter(wt); // The UserWidget that owns this WidgetTree
-                    if (!wtOuter) continue;
-
-                    // Check if the UserWidget IS the HUD or its outer chain reaches the HUD
-                    if (wtOuter == hudInst) {
-                        hudCurrenciesWidget = currWidgets[w];
-                        Log("HUD Currencies widget: 0x%llX (WidgetTree->HUD direct)\n", (uintptr_t)hudCurrenciesWidget);
-                        break;
-                    }
-                    // Also check one more level (WidgetTree -> subwidget -> HUD)
-                    void* wtOuterOuter = GetObjOuter(wtOuter);
-                    if (wtOuterOuter == hudInst) {
-                        hudCurrenciesWidget = currWidgets[w];
-                        Log("HUD Currencies widget: 0x%llX (WidgetTree->sub->HUD)\n", (uintptr_t)hudCurrenciesWidget);
-                        break;
-                    }
-                }
-
-                // If not found via direct chain, try matching by name suffix
-                if (!hudCurrenciesWidget) {
-                    wchar_t hudName[256];
-                    GetObjectName(hudInst, hudName, 256);
-                    // Extract the numeric suffix from the HUD name
-                    for (int w = 0; w < currWidgetCount; w++) {
-                        void* wt = currWidgetOuters[w];
-                        if (!wt) continue;
-                        wchar_t wtName[256];
-                        GetObjectName(wt, wtName, 256);
-                        // WidgetTree without a number suffix = BP template, not instance
-                        // We want the one that's part of the active HUD
-                        Log("  CurrWidget[%d]: outer=\"%ls\" outerOuter=", w, wtName);
-                        void* wtOuter = GetObjOuter(wt);
-                        if (wtOuter) {
-                            wchar_t wtob[256]; GetObjectName(wtOuter, wtob, 256);
-                            Log("\"%ls\"", wtob);
-                            // Check if outerOuter name contains HUD identifier
-                            if (wcsstr(wtob, L"UI_HUD_Game_RH_C") || wcsstr(wtob, L"ValHUDStateTracker")) {
-                                hudCurrenciesWidget = currWidgets[w];
-                                Log(" <-- MATCH!");
-                            }
-                        }
-                        Log("\n");
-                    }
-                }
-            }
-
-            Log("\n--- RESULTS ---\n");
-            Log("GetMatchCurrency: %s\n", getMatchCurrencyFunc?"OK":"NO");
-            Log("SetVisibility: %s\n", setVisibilityFunc?"OK":"NO");
-            Log("AddCurrencyWidget: %s (PS=73)\n", addCurrencyWidgetFunc?"OK":"NO");
-            Log("SetCurrencyId: %s (PS=50)\n", setCurrencyIdFunc?"OK":"NO");
-            Log("BindCurrency: %s (PS=33)\n", bindCurrencyFunc?"OK":"NO");
-            Log("PlayerState: %s\n", playerStateInst?"OK":"NO");
-            Log("HUD: %s\n", hudInst?"OK":"NO");
-            Log("HUD Currencies: %s (0x%llX)\n", hudCurrenciesWidget?"OK":"NO", (uintptr_t)hudCurrenciesWidget);
-            Log("InventoryComp: %s\n", inventoryComp?"OK":"NO");
-            Log("Total Currencies widgets: %d\n", currWidgetCount);
-
-            // Read currency value
-            if (getMatchCurrencyFunc && playerStateInst && gProcessEventAddr) {
-                __declspec(align(16)) uint8_t p[16] = {};
-                __try {
-                    ((ProcessEvent_fn)gProcessEventAddr)(playerStateInst, getMatchCurrencyFunc, p);
-                    Log("*** GetMatchCurrency = %d ***\n", *(int32_t*)p);
-                } __except(EXCEPTION_EXECUTE_HANDLER) { Log("GetMatchCurrency CRASHED\n"); }
-            }
-
-            // Dump bytes on the HUD's Currencies widget + its parent for visibility comparison
-            if (hudCurrenciesWidget && IsSafeToRead(hudCurrenciesWidget, 0x200)) {
-                uint8_t* base = (uint8_t*)hudCurrenciesWidget;
-                Log("\nHUD Currencies widget bytes:\n");
-                for (int row = 0x28; row < 0x178; row += 0x20) {
-                    Log("  +0x%03X: ", row);
-                    for (int b = 0; b < 0x20 && (row+b) < 0x178; b++)
-                        Log("%02X ", base[row + b]);
-                    Log("\n");
-                }
-
-                // Also trace up to the parent widget and dump its bytes
-                // UPanelSlot is at some offset in UWidget, then the parent panel via slot
-                // The parent UWidget outer might be the WidgetTree, check via outer
-                void* parentPanel = nullptr;
-                // In UE5 UWidget, the Slot pointer is typically early in the struct
-                // Try reading potential parent pointers
-                for (int off = 0x28; off <= 0x60; off += 8) {
-                    uintptr_t ptr = 0;
-                    if (!SafeRead64((uintptr_t)hudCurrenciesWidget + off, &ptr) || !ptr) continue;
-                    if (!IsSafeToRead((void*)ptr, 0x28)) continue;
-                    void* pc = GetObjClass((void*)ptr);
-                    if (!pc) continue;
-                    wchar_t pcName[256];
-                    if (GetObjectName(pc, pcName, 256)) {
-                        Log("  Ptr at +0x%X -> 0x%llX class=\"%ls\"", off, ptr, pcName);
-                        // Check if this looks like a parent widget
-                        if (wcsstr(pcName, L"CanvasPanel") || wcsstr(pcName, L"VerticalBox") ||
-                            wcsstr(pcName, L"HorizontalBox") || wcsstr(pcName, L"Overlay") ||
-                            wcsstr(pcName, L"Widget") || wcsstr(pcName, L"Border") ||
-                            wcsstr(pcName, L"SizeBox")) {
-                            parentPanel = (void*)ptr;
-                            Log(" <-- parent candidate");
-                        }
-                        Log("\n");
-                    }
-                }
-
-                if (parentPanel && IsSafeToRead(parentPanel, 0x178)) {
-                    uint8_t* pbase = (uint8_t*)parentPanel;
-                    wchar_t pName[256], pcName[256];
-                    GetObjectName(parentPanel, pName, 256);
-                    void* pc = GetObjClass(parentPanel);
-                    if (pc) GetObjectName(pc, pcName, 256);
-                    Log("\nParent widget: \"%ls\" class=\"%ls\" (0x%llX)\n", pName, pcName, (uintptr_t)parentPanel);
-                    for (int row = 0x28; row < 0x178; row += 0x20) {
-                        Log("  +0x%03X: ", row);
-                        for (int b = 0; b < 0x20 && (row+b) < 0x178; b++)
-                            Log("%02X ", pbase[row + b]);
-                        Log("\n");
-                    }
-                }
-            }
-
-            Log("=== F7 DONE ===\n\n");
-        }
-
-        if (IsKeyJustPressed(VK_F6)) {
-            SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
-            SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
-            Log("\n=== F6: CURRENCY HUD EXPERIMENT ===\n");
-
-            // Single pass to find everything we need
-            void* setVisFunc = nullptr;
-            void* mechUpdatedFunc = nullptr;
-            void* addCurrFunc = nullptr;
-            void* setCurrIdFunc = nullptr;
-            void* bindCurrFunc = nullptr;
-            void* getMCFunc = nullptr;
-            void* psInst = nullptr;
-            void* visorCurrWidget = nullptr;
-
-            wchar_t nb[256], cb[256], ob[256];
-            for (int i = 0; i < gNumElements; i++) {
-                void* o = GetUObject(i); if (!o) continue;
-                if (!GetObjectName(o, nb, 256)) continue;
-
-                // Functions
-                if (!setVisFunc && wcscmp(nb, L"SetVisibility") == 0) {
-                    int32_t ps = 0; SafeRead32((uintptr_t)o + 0x58, &ps);
-                    if (ps >= 1 && ps <= 8) setVisFunc = o;
-                }
-                if (!getMCFunc && wcscmp(nb, L"GetMatchCurrency") == 0) {
-                    void* ou = GetObjOuter(o);
-                    if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"ValPlayerState"))
-                        getMCFunc = o;
-                }
-                if (!mechUpdatedFunc && wcscmp(nb, L"OnAvailableRunProgressionMechanicsUpdated") == 0) {
-                    void* ou = GetObjOuter(o);
-                    if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"WBP_Game_Currencies_C"))
-                        mechUpdatedFunc = o;
-                }
-                if (!addCurrFunc && wcscmp(nb, L"AddCurrencyWidget") == 0) {
-                    void* ou = GetObjOuter(o);
-                    if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"WBP_Game_Currencies_C"))
-                        addCurrFunc = o;
-                }
-                if (!setCurrIdFunc && wcscmp(nb, L"SetCurrencyId") == 0) {
-                    void* ou = GetObjOuter(o);
-                    if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"WBP_Game_Currency_C"))
-                        setCurrIdFunc = o;
-                }
-                if (!bindCurrFunc && wcscmp(nb, L"BindCurrency") == 0) {
-                    void* ou = GetObjOuter(o);
-                    if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"WBP_Game_Currency_C"))
-                        bindCurrFunc = o;
-                }
-
-                if (wcsncmp(nb, L"Default__", 9) == 0) continue;
-                void* c = GetObjClass(o); if (!c) continue;
-                if (!GetObjectName(c, cb, 256)) continue;
-
-                // PlayerState
-                if (!psInst && wcsstr(cb, L"ValPlayerState") && !wcsstr(cb, L"BlueprintGenerated"))
-                    psInst = o;
-
-                // Currencies widget inside UI_Game_Visor_C
-                if (!visorCurrWidget && wcscmp(cb, L"WBP_Game_Currencies_C") == 0 && wcscmp(nb, L"Currencies") == 0) {
-                    void* ou = GetObjOuter(o); // WidgetTree
-                    if (ou) {
-                        void* ouou = GetObjOuter(ou); // The UserWidget
-                        if (ouou && GetObjectName(ouou, ob, 256) && wcsstr(ob, L"UI_Game_Visor_C")) {
-                            visorCurrWidget = o;
-                            Log("Found Visor Currencies widget: 0x%llX (outer->%ls)\n", (uintptr_t)o, ob);
-                        }
-                    }
-                }
-            }
-
-            Log("SetVis=%s MechUpd=%s AddCurr=%s SetId=%s Bind=%s GetMC=%s PS=%s Visor=%s\n",
-                setVisFunc?"OK":"NO", mechUpdatedFunc?"OK":"NO", addCurrFunc?"OK":"NO",
-                setCurrIdFunc?"OK":"NO", bindCurrFunc?"OK":"NO", getMCFunc?"OK":"NO",
-                psInst?"OK":"NO", visorCurrWidget?"OK":"NO");
-
-            if (!visorCurrWidget || !gProcessEventAddr) {
-                Log("Missing critical objects for experiment\n");
-            } else {
-                gCurrReq.visorCurrenciesWidget = visorCurrWidget;
-                gCurrReq.setVisibilityFunc = setVisFunc;
-                gCurrReq.onMechanicsUpdatedFunc = mechUpdatedFunc;
-                gCurrReq.addCurrencyWidgetFunc = addCurrFunc;
-                gCurrReq.setCurrencyIdFunc = setCurrIdFunc;
-                gCurrReq.bindCurrencyFunc = bindCurrFunc;
-                gCurrReq.playerStateInst = psInst;
-                gCurrReq.getMatchCurrencyFunc = getMCFunc;
-                gCurrReq.processEventAddr = gProcessEventAddr;
-                gCurrReq.done = false;
-                gCurrReq.success = false;
-
-                TickHook::Uninstall();
-                if (TickHook::Install(0)) {
-                    TickHook::QueueOnGameThread(GameThreadCurrencyExperiment);
-                    for (int w = 0; w < 100 && !gCurrReq.done; w++) Sleep(50);
-                    if (gCurrReq.success)
-                        Log("=== F6 EXPERIMENT SUCCEEDED ===\n\n");
-                    else
-                        Log("=== F6 EXPERIMENT FAILED ===\n\n");
-                } else {
-                    Log("Failed to install tick hook\n");
-                }
-            }
-        }
-
-        if (IsKeyJustPressed(VK_F8)) {
-            SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
-            SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
-            Log("\n=== F8: CURRENCY DATA MODEL DUMP (%d objects) ===\n", gNumElements);
-
-            void* addCurrFunc = nullptr;   // AddCurrencyWidget on WBP_Game_Currencies_C
-            void* setCurrIdFunc = nullptr; // SetCurrencyId on WBP_Game_Currency_C
-            void* bindCurrFunc = nullptr;  // BindCurrency on WBP_Game_Currency_C
-            void* getMCFunc = nullptr;     // GetMatchCurrency on ValPlayerState
-
-            wchar_t nb[256], ob[256], cb[256];
-            for (int i = 0; i < gNumElements; i++) {
-                void* o = GetUObject(i); if (!o) continue;
-                if (!GetObjectName(o, nb, 256)) continue;
-
-                if (!addCurrFunc && wcscmp(nb, L"AddCurrencyWidget") == 0) {
-                    void* ou = GetObjOuter(o);
-                    if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"WBP_Game_Currencies_C"))
-                        addCurrFunc = o;
-                }
-                if (!setCurrIdFunc && wcscmp(nb, L"SetCurrencyId") == 0) {
-                    void* ou = GetObjOuter(o);
-                    if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"WBP_Game_Currency_C"))
-                        setCurrIdFunc = o;
-                }
-                if (!bindCurrFunc && wcscmp(nb, L"BindCurrency") == 0) {
-                    void* ou = GetObjOuter(o);
-                    if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"WBP_Game_Currency_C"))
-                        bindCurrFunc = o;
-                }
-                if (!getMCFunc && wcscmp(nb, L"GetMatchCurrency") == 0) {
-                    void* ou = GetObjOuter(o);
-                    if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"ValPlayerState"))
-                        getMCFunc = o;
-                }
-            }
-
-            Log("\n--- FUNCTION PARAMETERS ---\n");
-            if (getMCFunc)   { Log("GetMatchCurrency (0x%llX):\n", (uintptr_t)getMCFunc);     DumpStructProperties(getMCFunc, L"GetMatchCurrency"); }   else Log("GetMatchCurrency NOT FOUND\n");
-            if (addCurrFunc) { Log("AddCurrencyWidget (0x%llX):\n", (uintptr_t)addCurrFunc);   DumpStructProperties(addCurrFunc, L"AddCurrencyWidget"); } else Log("AddCurrencyWidget NOT FOUND\n");
-            if (setCurrIdFunc){ Log("SetCurrencyId (0x%llX):\n", (uintptr_t)setCurrIdFunc);    DumpStructProperties(setCurrIdFunc, L"SetCurrencyId"); }  else Log("SetCurrencyId NOT FOUND\n");
-            if (bindCurrFunc){ Log("BindCurrency (0x%llX):\n", (uintptr_t)bindCurrFunc);       DumpStructProperties(bindCurrFunc, L"BindCurrency"); }   else Log("BindCurrency NOT FOUND\n");
-
-            // Dump every Enum/ScriptStruct whose name mentions Currency.
-            Log("\n--- CURRENCY ENUMS / STRUCTS ---\n");
-            for (int i = 0; i < gNumElements; i++) {
-                void* o = GetUObject(i); if (!o) continue;
-                if (!GetObjectName(o, nb, 256)) continue;
-                if (!wcsstr(nb, L"Currency")) continue;
-                void* c = GetObjClass(o); if (!c) continue;
-                if (!GetObjectName(c, cb, 256)) continue;
-                if (wcscmp(cb, L"Enum") == 0) {
-                    Log("ENUM \"%ls\" (0x%llX):\n", nb, (uintptr_t)o);
-                    DumpEnum(o);
-                } else if (wcscmp(cb, L"ScriptStruct") == 0) {
-                    Log("STRUCT \"%ls\" (0x%llX):\n", nb, (uintptr_t)o);
-                    DumpStructProperties(o, nb);
-                }
-            }
-
-            Log("=== F8 DONE ===\n\n");
-        }
-
-        if (IsKeyJustPressed(VK_F5)) {
-            SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
-            SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
-            Log("\n=== F5: VIAL/NANITE DISCOVERY (%d objects) ===\n", gNumElements);
-
-            const wchar_t* kw[] = { L"vial", L"nanite", L"scrap", L"wallet", L"resource" };
-            const int nkw = 5;
-            wchar_t nb[256], cb[256], ob[256];
-            int hits = 0, currWidgetInsts = 0;
-            for (int i = 0; i < gNumElements; i++) {
-                void* o = GetUObject(i); if (!o) continue;
-                if (!GetObjectName(o, nb, 256)) continue;
-                void* c = GetObjClass(o);
-                cb[0] = 0; if (c) GetObjectName(c, cb, 256);
-
-                bool match = false;
-                for (int k = 0; k < nkw; k++) if (ContainsCI(nb, kw[k]) || ContainsCI(cb, kw[k])) { match = true; break; }
-                if (match && hits < 400) {
-                    void* ou = GetObjOuter(o); ob[0]=0; if (ou) GetObjectName(ou, ob, 256);
-                    Log("  obj=\"%ls\" class=\"%ls\" outer=\"%ls\" (0x%llX)\n", nb, cb, ob, (uintptr_t)o);
-                    hits++;
-                    if (wcscmp(cb, L"Enum") == 0) DumpEnum(o);
-                }
-
-                // Live individual-currency widget instances (one shows the vial count in zone 4)
-                if (wcscmp(cb, L"WBP_Game_Currency_C") == 0 && wcsncmp(nb, L"Default__", 9) != 0) {
-                    if (currWidgetInsts < 32 && IsSafeToRead(o, 0x300)) {
-                        uint8_t* base = (uint8_t*)o;
-                        Log("  CURRENCY WIDGET \"%ls\" (0x%llX):\n", nb, (uintptr_t)o);
-                        for (int off = 0x100; off < 0x300; off += 4) {
-                            int32_t v = *(int32_t*)(base + off);
-                            if (v > 0 && v < 1000000)
-                                Log("    +0x%03X = %d\n", off, v);
-                        }
-                        currWidgetInsts++;
-                    }
-                }
-            }
-            Log("Discovery hits=%d, currency-widget instances=%d\n", hits, currWidgetInsts);
-            Log("=== F5 DONE ===\n\n");
-        }
-
-        // Trace each currency widget to the model object it's bound to (shared source).
-        if (IsKeyJustPressed(VK_F3)) {
-            SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
-            SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
-            Log("\n=== F3: CURRENCY WIDGET -> MODEL TRACE (%d objects) ===\n", gNumElements);
-
-            const wchar_t* tk[] = { L"currency", L"wallet", L"data", L"item", L"model",
-                                    L"match", L"run", L"store", L"inventory", L"player",
-                                    L"nanite", L"vial" };
-            const int ntk = 12;
-            wchar_t nb[256], cb[256], tnb[256], tcb[256];
-            int widgets = 0;
-            for (int i = 0; i < gNumElements; i++) {
-                void* o = GetUObject(i); if (!o) continue;
-                if (!GetObjectName(o, nb, 256) || wcsncmp(nb, L"Default__", 9) == 0) continue;
-                void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
-                if (wcscmp(cb, L"WBP_Game_Currency_C") != 0) continue;
-                if (widgets++ >= 16) break;
-
-                int32_t v570 = 0, v574 = 0;
-                SafeRead32((uintptr_t)o + 0x570, &v570);
-                SafeRead32((uintptr_t)o + 0x574, &v574);
-                Log("WIDGET \"%ls\" (0x%llX) value@0x570=%d from@0x574=%d\n",
-                    nb, (uintptr_t)o, v570, v574);
-
-                for (int off = 0x28; off < 0x800; off += 8) {
-                    uintptr_t p = 0;
-                    if (!SafeRead64((uintptr_t)o + off, &p) || p < 0x10000) continue;
-                    void* tc = GetObjClass((void*)p); if (!tc) continue;
-                    if (!GetObjectName(tc, tcb, 256)) continue;
-                    if (!GetObjectName((void*)p, tnb, 256)) continue;
-                    bool rel = false;
-                    for (int k = 0; k < ntk; k++) if (ContainsCI(tcb, tk[k]) || ContainsCI(tnb, tk[k])) { rel = true; break; }
-                    if (!rel) continue;
-                    Log("    +0x%03X -> 0x%llX \"%ls\" class=\"%ls\"\n", off, p, tnb, tcb);
-                }
-            }
-            Log("Traced %d currency widgets\n=== F3 DONE ===\n\n", widgets);
-        }
-
-        // CE-style changed-value scan: 1st press snapshots, spend vials, 2nd press diffs.
-        if (IsKeyJustPressed(VK_F4)) {
-            SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
-            SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
-
-            static const int SNAP_MAX = 2500000;
-            static struct { void* obj; int32_t off; int32_t val; } *snap = nullptr;
-            static int snapN = 0;
-            static bool armed = false;
-            if (!snap) snap = (decltype(snap))VirtualAlloc(nullptr, sizeof(*snap)*SNAP_MAX, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
-            if (!snap) { Log("F4: alloc failed\n"); return 0; }
-
-            // Broadened: gameplay singletons most likely to HOLD a match currency.
-            const wchar_t* ck[] = { L"playerstate", L"gamestate", L"inventory", L"wallet",
-                                    L"currency", L"nanite", L"vial", L"progression",
-                                    L"subsystem", L"manager", L"tracker", L"match",
-                                    L"run", L"mode", L"attribute", L"ability" };
-            const int nck = 16;
-            wchar_t nb[256], cb[256];
-
-            if (!armed) {
-                snapN = 0;
-                Log("\n=== F4: SNAPSHOT ===\n");
-                for (int i = 0; i < gNumElements && snapN < SNAP_MAX; i++) {
-                    void* o = GetUObject(i); if (!o) continue;
-                    if (!GetObjectName(o, nb, 256) || wcsncmp(nb, L"Default__", 9)==0) continue;
-                    void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
-                    if (wcscmp(cb, L"WBP_Game_Currency_C") == 0) continue; // skip display mirrors
-                    bool cur = false; for (int k=0;k<nck;k++) if (ContainsCI(cb, ck[k])) { cur=true; break; }
-                    if (!cur) continue;
-                    // One VirtualQuery to bound the read, then read ints directly (fast).
-                    MEMORY_BASIC_INFORMATION mbi;
-                    if (!VirtualQuery(o, &mbi, sizeof(mbi))) continue;
-                    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS|PAGE_GUARD)) || !mbi.Protect) continue;
-                    uintptr_t maxOff = ((uintptr_t)mbi.BaseAddress + mbi.RegionSize) - (uintptr_t)o;
-                    if (maxOff > 0x1200) maxOff = 0x1200;
-                    __try {
-                        for (uintptr_t off = 0x10; off + 4 <= maxOff && snapN < SNAP_MAX; off += 4) {
-                            int32_t v = *(int32_t*)((uint8_t*)o + off);
-                            float f = *(float*)((uint8_t*)o + off);
-                            bool keepInt = (v > 0 && v <= 10000000);
-                            bool keepFloat = (f >= 1.0f && f <= 10000000.0f && f == floorf(f));
-                            if (!keepInt && !keepFloat) continue;
-                            snap[snapN].obj=o; snap[snapN].off=(int32_t)off; snap[snapN].val=v; snapN++;
-                        }
-                    } __except(EXCEPTION_EXECUTE_HANDLER) {}
-                }
-                armed = true;
-                Log("Snapshot stored %d int fields. Spend some vials, then press F4 again.\n", snapN);
-                Log("=== F4 SNAPSHOT DONE ===\n\n");
-            } else {
-                Log("\n=== F4: DIFF ===\n");
-                int changes = 0;
-                for (int i = 0; i < snapN; i++) {
-                    if (!IsSafeToRead((uint8_t*)snap[i].obj + snap[i].off, 4)) continue;
-                    int32_t now = *(int32_t*)((uint8_t*)snap[i].obj + snap[i].off);
-                    if (now == snap[i].val) continue;
-                    if (changes < 600) {
-                        GetObjectName(snap[i].obj, nb, 256);
-                        void* c = GetObjClass(snap[i].obj); cb[0]=0; if (c) GetObjectName(c, cb, 256);
-                        float fOld = *(float*)&snap[i].val, fNow = *(float*)&now;
-                        Log("  CHANGED \"%ls\" class=\"%ls\" +0x%03X: int %d -> %d | float %.2f -> %.2f  (0x%llX)\n",
-                            nb, cb, snap[i].off, snap[i].val, now, fOld, fNow, (uintptr_t)snap[i].obj);
-                    }
-                    changes++;
-                }
-                armed = false;
-                Log("Total changed fields: %d (re-press F4 to take a fresh snapshot)\n", changes);
-                Log("=== F4 DIFF DONE ===\n\n");
-            }
-        }
-
-        // F1: pointer-owner reverse-resolver. For a CE address that F2 reports as heap
-        // (not inside any object body), find which UObject holds a POINTER into the heap
-        // block containing it. Reports owner object + field offset, plus the element offset
-        // (delta) of the target within the pointed-to buffer. Same .CT source as F2.
-        // Use after F2 flags an address as heap, to recover a stable obj->ptr->+off path.
-        if (IsKeyJustPressed(VK_F1)) {
-            SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
-            SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
-            Log("\n=== F1: POINTER-OWNER SCAN (%d objects) ===\n", gNumElements);
-
-            const char* ctPath = "C:\\Users\\jonathan\\Desktop\\Projects\\Deadzone\\DeadzoneSteam-Win64-Shipping.CT";
-            uintptr_t targets[64]; int nT = 0;
-            FILE* cf = nullptr; fopen_s(&cf, ctPath, "rb");
-            if (!cf) {
-                Log("F1: cannot open %hs\n", ctPath);
-            } else {
-                static char fbuf[65536];
-                size_t rd = fread(fbuf, 1, sizeof(fbuf)-1, cf); fclose(cf); fbuf[rd] = 0;
-                const char* p = fbuf;
-                while (nT < 64) {
-                    const char* a = strstr(p, "<Address>"); if (!a) break; a += 9;
-                    uintptr_t v = 0; bool any = false;
-                    while (*a) {
-                        char ch = *a; int d;
-                        if (ch>='0'&&ch<='9') d = ch-'0';
-                        else if (ch>='a'&&ch<='f') d = ch-'a'+10;
-                        else if (ch>='A'&&ch<='F') d = ch-'A'+10;
-                        else break;
-                        v = v*16 + d; any = true; a++;
-                    }
-                    if (any) targets[nT++] = v;
-                    p = a;
-                }
-                Log("F1: parsed %d target addresses from .CT\n", nT);
-            }
-
-            if (nT > 0) {
-                const uintptr_t WINDOW = 0x40000; // max bytes between a buffer-base ptr and the target
-                struct { void* obj; int32_t off; uintptr_t delta; int hits; } B[64] = {};
-                for (int t = 0; t < nT; t++) B[t].delta = (uintptr_t)-1;
-
-                for (int i = 0; i < gNumElements; i++) {
-                    void* o = GetUObject(i); if (!o) continue;
-                    MEMORY_BASIC_INFORMATION mbi;
-                    if (!VirtualQuery(o, &mbi, sizeof(mbi))) continue;
-                    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS|PAGE_GUARD)) || !mbi.Protect) continue;
-                    uintptr_t maxOff = ((uintptr_t)mbi.BaseAddress + mbi.RegionSize) - (uintptr_t)o;
-                    if (maxOff > 0x1400) maxOff = 0x1400;
-                    __try {
-                        for (uintptr_t off = 0x10; off + 8 <= maxOff; off += 8) {
-                            uintptr_t P = *(uintptr_t*)((uint8_t*)o + off);
-                            if (!P) continue;
-                            for (int t = 0; t < nT; t++) {
-                                if (P <= targets[t] && (targets[t] - P) <= WINDOW) {
-                                    B[t].hits++;
-                                    if ((targets[t] - P) < B[t].delta) { B[t].delta = targets[t] - P; B[t].obj = o; B[t].off = (int32_t)off; }
-                                }
-                            }
-                        }
-                    } __except(EXCEPTION_EXECUTE_HANDLER) {}
-                }
-
-                wchar_t nb[256], cb[256];
-                for (int t = 0; t < nT; t++) {
-                    int32_t iv = 0; bool okv = SafeRead32(targets[t], &iv);
-                    Log("\n[%d] target 0x%llX  value: int %d\n", t, (unsigned long long)targets[t], okv ? iv : -1);
-                    if (B[t].obj) {
-                        GetObjectName(B[t].obj, nb, 256);
-                        void* c = GetObjClass(B[t].obj); cb[0]=0; if (c) GetObjectName(c, cb, 256);
-                        Log("    owner ptr in \"%ls\" class=\"%ls\" base=0x%llX +0x%X => target = *(base+0x%X) + 0x%llX  (%d candidate ptrs)\n",
-                            nb, cb, (unsigned long long)(uintptr_t)B[t].obj, B[t].off, B[t].off, (unsigned long long)B[t].delta, B[t].hits);
-                    } else {
-                        Log("    no UObject holds a pointer within 0x%llX below this address.\n", (unsigned long long)WINDOW);
-                    }
-                }
-            }
-            Log("\n=== F1 DONE ===\n\n");
-        }
-
-        // F2: address-resolver. Parses <Address>HEX</Address> entries from the saved
-        // Cheat Engine .CT, then walks GUObjectArray to find which UObject body contains
-        // each absolute address (and at what offset). CE addresses change every launch,
-        // so we read them from the file at press-time rather than hardcoding.
-        // Workflow: scan in CE -> Save table (Ctrl+S) -> press F2.
-        if (IsKeyJustPressed(VK_F2)) {
-            SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
-            SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
-            Log("\n=== F2: ADDRESS RESOLVER (%d objects) ===\n", gNumElements);
-
-            const char* ctPath = "C:\\Users\\jonathan\\Desktop\\Projects\\Deadzone\\DeadzoneSteam-Win64-Shipping.CT";
-            uintptr_t targets[64]; int nT = 0;
-            FILE* cf = nullptr; fopen_s(&cf, ctPath, "rb");
-            if (!cf) {
-                Log("F2: cannot open %hs\n", ctPath);
-            } else {
-                static char fbuf[65536];
-                size_t rd = fread(fbuf, 1, sizeof(fbuf)-1, cf); fclose(cf); fbuf[rd] = 0;
-                const char* p = fbuf;
-                while (nT < 64) {
-                    const char* a = strstr(p, "<Address>");
-                    if (!a) break;
-                    a += 9;
-                    uintptr_t v = 0; bool any = false;
-                    while (*a) {
-                        char ch = *a; int d;
-                        if (ch>='0'&&ch<='9') d = ch-'0';
-                        else if (ch>='a'&&ch<='f') d = ch-'a'+10;
-                        else if (ch>='A'&&ch<='F') d = ch-'A'+10;
-                        else break;
-                        v = v*16 + d; any = true; a++;
-                    }
-                    if (any) targets[nT++] = v;
-                    p = a;
-                }
-                Log("F2: parsed %d target addresses from .CT\n", nT);
-            }
-
-            if (nT > 0) {
-                struct { void* hitObj; int32_t hitOff; void* nearObj; uintptr_t nearGap; int32_t nearSize; } R[64] = {};
-                for (int t = 0; t < nT; t++) R[t].nearGap = (uintptr_t)-1;
-
-                for (int i = 0; i < gNumElements; i++) {
-                    void* o = GetUObject(i); if (!o) continue;
-                    void* c = GetObjClass(o); if (!c) continue;
-                    int32_t sz = 0; SafeRead32((uintptr_t)c + 0x58, &sz);
-                    if (sz <= 0 || sz > 0x200000) continue;
-                    uintptr_t base = (uintptr_t)o, end = base + (uintptr_t)sz;
-                    for (int t = 0; t < nT; t++) {
-                        uintptr_t a = targets[t];
-                        if (a >= base && a < end) { R[t].hitObj = o; R[t].hitOff = (int32_t)(a - base); }
-                        else if (a >= base && (a - base) < R[t].nearGap) { R[t].nearGap = a - base; R[t].nearObj = o; R[t].nearSize = sz; }
-                    }
-                }
-
-                wchar_t nb[256], cb[256];
-                for (int t = 0; t < nT; t++) {
-                    int32_t iv = 0; bool okv = SafeRead32(targets[t], &iv); float fv = *(float*)&iv;
-                    if (okv) Log("\n[%d] target 0x%llX  value: int %d / float %.3f\n", t, (unsigned long long)targets[t], iv, fv);
-                    else     Log("\n[%d] target 0x%llX  (value unreadable)\n", t, (unsigned long long)targets[t]);
-                    if (R[t].hitObj) {
-                        GetObjectName(R[t].hitObj, nb, 256);
-                        void* c = GetObjClass(R[t].hitObj); cb[0]=0; if (c) GetObjectName(c, cb, 256);
-                        Log("    INSIDE object \"%ls\" class=\"%ls\" base=0x%llX +0x%X\n",
-                            nb, cb, (unsigned long long)(uintptr_t)R[t].hitObj, R[t].hitOff);
-                    } else if (R[t].nearObj) {
-                        GetObjectName(R[t].nearObj, nb, 256);
-                        void* c = GetObjClass(R[t].nearObj); cb[0]=0; if (c) GetObjectName(c, cb, 256);
-                        Log("    NOT in any object body (heap/TArray/TMap likely).\n");
-                        Log("    nearest object below: \"%ls\" class=\"%ls\" base=0x%llX size=0x%X => target is base+0x%llX (past end)\n",
-                            nb, cb, (unsigned long long)(uintptr_t)R[t].nearObj, R[t].nearSize, (unsigned long long)R[t].nearGap);
-                    } else {
-                        Log("    NOT in any object body and no object below it.\n");
-                    }
-                }
-            }
-            Log("\n=== F2 DONE ===\n\n");
-        }
-
-        // F11: harvest the SanctityToken FPrimaryAssetId from a live currency widget.
-        // Press in ZONE 4 (where the SanctityToken widget exists). Also dumps the
-        // WBP_Game_Currency_C CurrencyId property offsets + AddCurrencyWidget params.
-        if (IsKeyJustPressed(VK_F11)) {
-            SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
-            SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
-            Log("\n=== F11: CURRENCY ID HARVEST (%d objects) ===\n", gNumElements);
-
-            void* currencyClass = nullptr;   // WBP_Game_Currency_C (per-currency) class
-            void* addCurrFunc = nullptr;     // AddCurrencyWidget on WBP_Game_Currencies_C
-            wchar_t nb[256], cb[256], ob[256];
-
-            for (int i = 0; i < gNumElements; i++) {
-                void* o = GetUObject(i); if (!o) continue;
-                if (!GetObjectName(o, nb, 256)) continue;
-                if (!currencyClass && wcscmp(nb, L"WBP_Game_Currency_C") == 0) {
-                    void* c = GetObjClass(o);
-                    // UMG widget classes are WidgetBlueprintGeneratedClass — match by substring.
-                    if (c && GetObjectName(c, cb, 256) &&
-                        (wcsstr(cb, L"BlueprintGeneratedClass") || wcscmp(cb, L"Class")==0))
-                        currencyClass = o;
-                }
-                if (!addCurrFunc && wcscmp(nb, L"AddCurrencyWidget") == 0) {
-                    void* ou = GetObjOuter(o);
-                    if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"WBP_Game_Currencies_C"))
-                        addCurrFunc = o;
-                }
-            }
-
-            // (A) Walk class properties; collect candidate FPrimaryAssetId offsets (16B structs).
-            int candOff[16] = {}; wchar_t candName[16][64] = {}; int candCount = 0;
-            if (currencyClass) {
-                Log("WBP_Game_Currency_C class 0x%llX — currency properties:\n", (uintptr_t)currencyClass);
-                uintptr_t field = 0; SafeRead64((uintptr_t)currencyClass + 0x50, &field);
-                int guard = 0;
-                while (field && IsSafeToRead((void*)field, 0x50) && guard++ < 256) {
-                    wchar_t pname[256], ptype[256];
-                    GetFFieldName((void*)field, pname, 256);
-                    GetFFieldClassName((void*)field, ptype, 256);
-                    int32_t off = 0, elemSize = 0;
-                    SafeRead32(field + 0x4C, &off);
-                    SafeRead32(field + 0x3C, &elemSize);
-                    if ((wcsstr(pname, L"Currency") || wcsstr(pname, L"AssetId")) &&
-                        wcsstr(ptype, L"Struct") && elemSize >= 12 && elemSize <= 32) {
-                        Log("  prop \"%ls\" type=%ls off=0x%X size=%d\n", pname, ptype, off, elemSize);
-                        if (candCount < 16) {
-                            candOff[candCount] = off;
-                            wcsncpy_s(candName[candCount], pname, 63);
-                            candCount++;
-                        }
-                    }
-                    SafeRead64(field + 0x20, &field);
-                }
-            } else Log("WBP_Game_Currency_C class NOT FOUND\n");
-
-            // (B) AddCurrencyWidget param layout.
-            if (addCurrFunc) { Log("AddCurrencyWidget params:\n"); DumpStructProperties(addCurrFunc, L"AddCurrencyWidget"); }
-            else Log("AddCurrencyWidget func NOT FOUND\n");
-
-            // (C) Brute-force scan each live currency widget body for an FName that
-            // resolves to a currency name. FPrimaryAssetId = {type FName @X-8}{name FName @X}.
-            int instCount = 0;
-            for (int i = 0; i < gNumElements; i++) {
-                void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
-                void* c = GetObjClass(o);
-                if (!c || !GetObjectName(c, cb, 256) || wcscmp(cb, L"WBP_Game_Currency_C") != 0) continue;
-                instCount++;
-                GetObjectName(o, nb, 256);
-
-                int32_t instSize = 0; SafeRead32((uintptr_t)c + 0x58, &instSize);
-                if (instSize < 0x40 || instSize > 0x4000) instSize = 0x800;
-                uintptr_t base = (uintptr_t)o;
-                bool printedHdr = false;
-                for (int off = 0x10; off + 8 <= instSize; off += 4) {
-                    FName fn;
-                    if (!SafeRead32(base + off + 0, &fn.ComparisonIndex)) continue;
-                    if (!SafeRead32(base + off + 4, &fn.Number)) continue;
-                    if (fn.ComparisonIndex <= 0 || fn.ComparisonIndex > 8000000) continue;
-                    wchar_t s[256] = L"";
-                    if (!GetFNameStr(&fn, s, 256) || !s[0]) continue;
-                    if (!(ContainsCI(s, L"sanctity") || ContainsCI(s, L"scrap") ||
-                          ContainsCI(s, L"currency") || ContainsCI(s, L"token") ||
-                          ContainsCI(s, L"tech"))) continue;
-
-                    // Treat this FName as the PrimaryAssetName; type FName is 8 bytes before.
-                    uintptr_t idAddr = base + off - 8;
-                    wchar_t ts[256] = L"";
-                    if (off >= 8 + 0x10 && IsSafeToRead((void*)idAddr, 8)) {
-                        FName tfn; SafeRead32(idAddr + 0, &tfn.ComparisonIndex); SafeRead32(idAddr + 4, &tfn.Number);
-                        GetFNameStr(&tfn, ts, 256);
-                    }
-                    if (!printedHdr) { Log("instance[%d] \"%ls\" 0x%llX size=0x%X\n", instCount, nb, base, instSize); printedHdr = true; }
-                    Log("    @0x%X name=\"%ls\"  (type@-8=\"%ls\")\n", off, s, ts);
-
-                    if (ContainsCI(s, L"sanctity") && !gSanctityCurrencyIdValid && IsSafeToRead((void*)idAddr, 16)) {
-                        memcpy(gSanctityCurrencyId, (void*)idAddr, 16);
-                        gSanctityCurrencyIdValid = true;
-                        Log("    *** CACHED SanctityToken CurrencyId @0x%X: type=\"%ls\" name=\"%ls\" "
-                            "raw=%08X %08X %08X %08X ***\n", off - 8, ts, s,
-                            *(uint32_t*)(idAddr+0), *(uint32_t*)(idAddr+4),
-                            *(uint32_t*)(idAddr+8), *(uint32_t*)(idAddr+12));
-                    }
-                }
-            }
-            Log("Live WBP_Game_Currency_C instances: %d  | cached=%s\n",
-                instCount, gSanctityCurrencyIdValid ? "YES" : "NO");
-            Log("=== F11 DONE ===\n\n");
-        }
-
-        // F12: in the CURRENT zone, call AddCurrencyWidget(SanctityToken) on the live
-        // WBP_Game_Currencies_C container so the game draws + auto-binds the vial widget.
-        // Self-sufficient: rebuilds the CurrencyId by name — no zone-4 visit / F11 needed.
-        if (IsKeyJustPressed(VK_F12)) {
-            Log("\n=== F12: ADD CURRENCY WIDGET (manual) ===\n");
-            DoAddVials();
         }
     }
     return 0;

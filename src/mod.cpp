@@ -136,8 +136,12 @@ static void GameThreadAddCurrency() {
     memcpy(p, gAddReq.currencyId, 16); // FPrimaryAssetId at param offset 0
     __try {
         pe(gAddReq.container, gAddReq.addCurrencyWidgetFunc, p);
-        Log("[GT-Add] AddCurrencyWidget OK (retptr@+16=0x%llX, @+24=0x%llX)\n",
-            *(uintptr_t*)(p + 16), *(uintptr_t*)(p + 24));
+        Log("[GT-Add] AddCurrencyWidget OK on container 0x%llX; param buf after call: "
+            "%02X%02X%02X%02X %02X%02X%02X%02X | +16 0x%llX | +24 0x%llX | +32 0x%llX | +40 0x%llX\n",
+            (uintptr_t)gAddReq.container,
+            p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
+            *(uintptr_t*)(p + 16), *(uintptr_t*)(p + 24),
+            *(uintptr_t*)(p + 32), *(uintptr_t*)(p + 40));
         gAddReq.success = true;
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         Log("[GT-Add] AddCurrencyWidget CRASHED\n");
@@ -683,19 +687,80 @@ static void* FindCurrentWorld(bool verbose = false) {
     return result;
 }
 
-// True if a SanctityToken currency widget already exists (native zone 4, or already added).
-static bool SanctityWidgetPresent() {
-    wchar_t cb[256], ns[256];
+// FPrimaryAssetId offset inside WBP_Game_Currency_C, derived at runtime from a
+// live widget (game updates move it; 0x55C was the pre-2026-06-04 value).
+static int gCurrencyIdOffset = 0;
+
+// One pass over live WBP_Game_Currency_C instances. Derives gCurrencyIdOffset,
+// reports whether a SanctityToken widget already exists, and identifies the
+// LIVE currencies container — the WBP_Game_Currencies_C that actually owns the
+// existing Scrap/Tech widgets (there can be more than one container instance;
+// adding to a non-displayed one silently does nothing).
+struct CurrencyScanResult {
+    int   widgetCount;     // live currency widget instances found
+    bool  sanctityPresent; // a widget already shows SanctityToken
+    void* liveContainer;   // container owning the most existing widgets
+};
+
+static void ScanCurrencyWidgets(CurrencyScanResult* r, bool verbose) {
+    r->widgetCount = 0; r->sanctityPresent = false; r->liveContainer = nullptr;
+    struct { void* c; int n; } tally[8] = {};
+    wchar_t cb[256], ns[256], ts[256];
     for (int i = 0; i < gNumElements; i++) {
         void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
         void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
         if (wcscmp(cb, L"WBP_Game_Currency_C") != 0) continue;
-        uintptr_t a = (uintptr_t)o + CURRENCY_ID_OFFSET + 8; // name FName
-        if (!IsSafeToRead((void*)a, 8)) continue;
-        FName n; SafeRead32(a + 0, &n.ComparisonIndex); SafeRead32(a + 4, &n.Number);
-        if (GetFNameStr(&n, ns, 256) && wcsstr(ns, L"SanctityToken")) return true;
+        r->widgetCount++;
+
+        // Derive the FPrimaryAssetId offset from the first widget that has a
+        // valid {type="ValItemAsset", name="Item_Currency_*"} pair in its body.
+        if (!gCurrencyIdOffset) {
+            for (int off = 0x400; off <= 0x900; off += 4) {
+                FName t, n;
+                if (!FastRead32((uintptr_t)o + off + 0, &t.ComparisonIndex)) break;
+                FastRead32((uintptr_t)o + off + 4, &t.Number);
+                FastRead32((uintptr_t)o + off + 8, &n.ComparisonIndex);
+                FastRead32((uintptr_t)o + off + 12, &n.Number);
+                if (!GetFNameStr(&t, ts, 256) || wcscmp(ts, L"ValItemAsset") != 0) continue;
+                if (!GetFNameStr(&n, ns, 256) || wcsncmp(ns, L"Item_Currency_", 14) != 0) continue;
+                gCurrencyIdOffset = off;
+                Log("[Vials] derived CurrencyId offset: +0x%X (was 0x%X pre-update) via %ls\n",
+                    off, CURRENCY_ID_OFFSET, ns);
+                break;
+            }
+        }
+
+        if (gCurrencyIdOffset) {
+            FName n;
+            if (FastRead32((uintptr_t)o + gCurrencyIdOffset + 8, &n.ComparisonIndex)
+                && FastRead32((uintptr_t)o + gCurrencyIdOffset + 12, &n.Number)
+                && GetFNameStr(&n, ns, 256)) {
+                if (wcsstr(ns, L"SanctityToken")) r->sanctityPresent = true;
+                if (verbose) Log("[Vials] widget 0x%llX id=%ls\n", (uintptr_t)o, ns);
+            }
+        }
+
+        // Walk the outer chain to the owning WBP_Game_Currencies_C and tally it.
+        void* ou = o;
+        for (int d = 0; d < 6 && ou; d++) {
+            ou = GetObjOuter(ou);
+            void* oc = ou ? GetObjClass(ou) : nullptr;
+            if (oc && GetObjectName(oc, cb, 256) && wcscmp(cb, L"WBP_Game_Currencies_C") == 0) {
+                for (int t = 0; t < 8; t++) {
+                    if (tally[t].c == ou) { tally[t].n++; break; }
+                    if (!tally[t].c) { tally[t].c = ou; tally[t].n = 1; break; }
+                }
+                break;
+            }
+        }
     }
-    return false;
+    int best = 0;
+    for (int t = 0; t < 8; t++) {
+        if (tally[t].c && tally[t].n > best) { best = tally[t].n; r->liveContainer = tally[t].c; }
+        if (verbose && tally[t].c)
+            Log("[Vials] container 0x%llX owns %d currency widgets\n",
+                (uintptr_t)tally[t].c, tally[t].n);
+    }
 }
 
 // Spawn sanctified anvils at every fabricator. Returns 0 = not ready (retry later),
@@ -863,13 +928,19 @@ static int DoAddVials() {
     SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
 
     DWORD t0 = GetTickCount();
-    if (SanctityWidgetPresent()) {
-        Log("[Vials] SanctityToken widget already present — skip (check %lums)\n",
-            (unsigned long)(GetTickCount() - t0));
-        return 2;
+    CurrencyScanResult cs;
+    ScanCurrencyWidgets(&cs, true);
+    Log("[Vials] widget scan %lums: %d currency widgets, sanctity=%s, liveContainer=%s\n",
+        (unsigned long)(GetTickCount() - t0), cs.widgetCount,
+        cs.sanctityPresent ? "PRESENT" : "absent", cs.liveContainer ? "OK" : "NO");
+    if (cs.sanctityPresent) return 2;
+
+    // No live currency widgets yet = the HUD hasn't been built. Adding now
+    // would target a template/preload container and silently show nothing.
+    if (!cs.widgetCount || !cs.liveContainer) {
+        Log("[Vials] HUD not live yet (no existing currency widgets) — NOT READY, will retry\n");
+        return 0;
     }
-    Log("[Vials] widget-present check: %lums (not present)\n",
-        (unsigned long)(GetTickCount() - t0));
 
     t0 = GetTickCount();
     uint8_t currencyId[16] = {};
@@ -885,35 +956,29 @@ static int DoAddVials() {
 
     t0 = GetTickCount();
     void* addCurrFunc = nullptr;
-    void* container = nullptr;
-    wchar_t nb[256], cb[256], ob[256];
+    wchar_t nb[256], ob[256];
     for (int i = 0; i < gNumElements; i++) {
         void* o = GetUObject(i); if (!o) continue;
         if (!GetObjectName(o, nb, 256)) continue;
-        if (!addCurrFunc && wcscmp(nb, L"AddCurrencyWidget") == 0) {
+        if (wcscmp(nb, L"AddCurrencyWidget") == 0) {
             void* ou = GetObjOuter(o);
-            if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"WBP_Game_Currencies_C"))
+            if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"WBP_Game_Currencies_C")) {
                 addCurrFunc = o;
-        }
-        if (IsCDO(o)) continue;
-        void* c = GetObjClass(o); if (!c) continue;
-        if (!GetObjectName(c, cb, 256)) continue;
-        if (!container && wcscmp(cb, L"WBP_Game_Currencies_C") == 0 && wcscmp(nb, L"Currencies") == 0) {
-            void* ou = GetObjOuter(o);
-            void* ouou = ou ? GetObjOuter(ou) : nullptr;
-            if (ouou && GetObjectName(ouou, ob, 256) && wcsstr(ob, L"UI_Game_Visor_C")) container = o;
+                break;
+            }
         }
     }
-    Log("[Vials] HUD scan %lums: addFn=%s container=%s\n",
-        (unsigned long)(GetTickCount() - t0),
-        addCurrFunc?"OK":"NO", container?"OK":"NO");
+    int32_t addPS = 0;
+    if (addCurrFunc) SafeRead32((uintptr_t)addCurrFunc + 0x58, &addPS);
+    Log("[Vials] HUD scan %lums: addFn=%s (PropertiesSize=%d, was 73 pre-update)\n",
+        (unsigned long)(GetTickCount() - t0), addCurrFunc?"OK":"NO", addPS);
 
-    if (!addCurrFunc || !container) {
-        Log("[Vials] HUD container/func not ready — NOT READY, will retry\n");
+    if (!addCurrFunc) {
+        Log("[Vials] AddCurrencyWidget not found — NOT READY, will retry\n");
         return 0;
     }
 
-    gAddReq.container = container;
+    gAddReq.container = cs.liveContainer;
     gAddReq.addCurrencyWidgetFunc = addCurrFunc;
     gAddReq.processEventAddr = gProcessEventAddr;
     memcpy(gAddReq.currencyId, currencyId, 16);
@@ -927,10 +992,24 @@ static int DoAddVials() {
     for (int w = 0; w < 100 && !gAddReq.done; w++) { Sleep(50); waited++; }
     Log("[Vials] game-thread wait: %dms (done=%s success=%s)\n",
         waited * 50, gAddReq.done?"Y":"N", gAddReq.success?"Y":"N");
-    Log("[Vials] %s (total %lums)\n",
-        gAddReq.success ? "*** ADDED OK ***" : "ADD FAILED",
-        (unsigned long)(GetTickCount() - vialT0));
-    return gAddReq.success ? 1 : 0;
+    if (!gAddReq.success) {
+        Log("[Vials] ADD FAILED (total %lums)\n", (unsigned long)(GetTickCount() - vialT0));
+        return 0;
+    }
+
+    // The call not crashing is NOT proof a widget was created (the BP can
+    // early-out and return null). Verify a SanctityToken widget now exists;
+    // if not, report not-ready so the auto loop retries.
+    SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
+    ScanCurrencyWidgets(&cs, false);
+    if (cs.sanctityPresent) {
+        Log("[Vials] *** ADDED & VERIFIED *** (total %lums)\n",
+            (unsigned long)(GetTickCount() - vialT0));
+        return 1;
+    }
+    Log("[Vials] call returned OK but NO SanctityToken widget exists — will retry "
+        "(total %lums)\n", (unsigned long)(GetTickCount() - vialT0));
+    return 0;
 }
 
 // ============================================================
@@ -944,7 +1023,7 @@ static DWORD WINAPI ModThreadProc(LPVOID) {
     gLogFile = fopen(lp, "w");
     if (!gLogFile) return 0;
 
-    Log("=== SanctifyEverywhere v0.11 (fast scans, world-name zone detect) ===\n");
+    Log("=== SanctifyEverywhere v0.12 (verified vial add, live-container detect) ===\n");
     Log("Background thread ID: %lu\n", GetCurrentThreadId());
 
     HWND gw = nullptr;

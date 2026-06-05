@@ -45,7 +45,13 @@ uintptr_t gTextStart = 0, gTextSize = 0;
 uintptr_t gDataStart = 0, gDataSize = 0;
 uintptr_t gExeBase = 0, gExeEnd = 0;
 static uintptr_t gProcessEventAddr = 0;
-static FNameToString_fn gFNameToString = nullptr;
+
+// FNamePool (GNames) FNameEntryAllocator base — found by .data scan in InitUE.
+// Layout: +0x8 CurrentBlock (u32), +0xC CurrentByteCursor (u32), +0x10 Blocks[8192].
+// Names are decoded straight out of the pool with safe reads; no game code is
+// ever called, so a game update can never turn name lookup into a wild call
+// (the old FNAME_TOSTRING_OFFSET approach crashed after the 2026-06-04 update).
+static uintptr_t gNamePool = 0;
 
 // Cached pointers needed by the auto path (found once at startup).
 // K2_GetActorLocation is reused every frame to read fabricator positions.
@@ -55,7 +61,6 @@ static void* gGetLocFunc = nullptr;
 // Constants (Deadzone Rogue v1.4 - stable across ASLR)
 // ============================================================
 
-static const int64_t FNAME_TOSTRING_OFFSET = -0x0A27FB50;
 static const int PROCESS_EVENT_VTABLE_SLOT = 0x4C;
 static const int BEGIN_SPAWN_RETVAL_OFFSET = 0x88;
 static const int FINISH_SPAWN_RETVAL_OFFSET = 120;
@@ -320,16 +325,42 @@ bool SafeRead32(uintptr_t a, int32_t* o) {
     __try { *o = *(int32_t*)a; return true; } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// Decode one FNameEntry from a candidate pool. Entry: u16 header (bIsWide:1,
+// LowercaseProbeHash:5, Len:10) followed by Len ANSI bytes or UTF-16 chars.
+// Block = index >> 16, byte offset = (index & 0xFFFF) * 2 (stride 2).
+static bool PoolReadName(uintptr_t pool, uint32_t idx, wchar_t* buf, int sz) {
+    buf[0] = 0;
+    uint32_t block = idx >> 16;
+    uint32_t off = (idx & 0xFFFF) * 2;
+    if (block >= 8192) return false;
+    uintptr_t bp = 0;
+    if (!SafeRead64(pool + 0x10 + (uintptr_t)block * 8, &bp) || !bp) return false;
+    int32_t h32 = 0;
+    if (!SafeRead32(bp + off, &h32)) return false;
+    uint16_t h = (uint16_t)h32;
+    int wide = h & 1, len = h >> 6;
+    if (len <= 0 || len >= sz || len > 1023) return false;
+    if (!IsSafeToRead((void*)(bp + off + 2), (size_t)(wide ? len * 2 : len))) return false;
+    __try {
+        if (wide) { memcpy(buf, (const void*)(bp + off + 2), (size_t)len * 2); buf[len] = 0; }
+        else {
+            const uint8_t* s = (const uint8_t*)(bp + off + 2);
+            for (int i = 0; i < len; i++) buf[i] = (wchar_t)s[i];
+            buf[len] = 0;
+        }
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { buf[0] = 0; return false; }
+}
+
 static bool GetFNameStr(const FName* n, wchar_t* buf, int sz) {
     buf[0] = 0;
-    if (!gFNameToString || !n) return false;
-    FString r = {0,0,0};
-    __try { gFNameToString(n, r); } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
-    if (r.Data && r.Count > 0 && IsSafeToRead(r.Data, 2)) {
-        __try { wcsncpy_s(buf, sz, r.Data, min(r.Count, sz-1)); return true; }
-        __except(EXCEPTION_EXECUTE_HANDLER) {}
+    if (!gNamePool || !n) return false;
+    if (!PoolReadName(gNamePool, (uint32_t)n->ComparisonIndex, buf, sz)) return false;
+    if (n->Number) { // match FNameToString: "_<Number-1>" suffix on numbered names
+        size_t l = wcslen(buf);
+        if ((int)l < sz - 1) swprintf_s(buf + l, sz - l, L"_%d", n->Number - 1);
     }
-    return false;
+    return true;
 }
 
 void* GetUObject(int32_t i) {
@@ -399,6 +430,32 @@ static bool ValidateObjArray(uintptr_t a, int32_t ne, int32_t nc, int is) {
     return v >= 5;
 }
 
+// True if p points at the FNameEntry for "None" (ANSI, len 4) — the entry that
+// always sits at offset 0 of FNamePool block 0. SEH guards cross-page reads.
+static bool LooksLikeNoneEntry(uintptr_t p) {
+    if (!IsSafeToRead((void*)p, 2)) return false;
+    __try {
+        uint16_t h = *(uint16_t*)p;
+        if ((h & 1) || (h >> 6) != 4) return false;
+        return memcmp((const void*)(p + 2), "None", 4) == 0;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Scan [lo,hi) of committed .data for a slot whose value points at the "None"
+// entry — that slot is &Blocks[0], i.e. pool base + 0x10. Returns the SLOT
+// address (so the caller can resume past a rejected candidate). SEH-wrapped so
+// a region disappearing mid-scan can't take the thread down.
+static uintptr_t ScanForNamePoolSlot(uintptr_t lo, uintptr_t hi) {
+    __try {
+        for (uintptr_t a = (lo + 7) & ~(uintptr_t)7; a + 8 <= hi; a += 8) {
+            uintptr_t p = *(uintptr_t*)a;
+            if (p < 0x10000 || p > 0x7FFFFFFFFFFFULL || (p & 1)) continue;
+            if (LooksLikeNoneEntry(p)) return a;
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
+}
+
 static bool InitUE() {
     gExeBase = (uintptr_t)GetModuleHandleA(nullptr);
     PIMAGE_DOS_HEADER d = (PIMAGE_DOS_HEADER)gExeBase;
@@ -432,16 +489,45 @@ static bool InitUE() {
     Log("GUObjectArray NOT FOUND\n"); return false;
 found_guoa:
 
-    // Compute FNameToString
-    uintptr_t guoaStruct = (uintptr_t)gObjArrayBase - 0x10;
-    uintptr_t fna = guoaStruct + FNAME_TOSTRING_OFFSET;
-    if (fna < gTextStart || fna >= gTextStart + gTextSize) { Log("FNameToString out of range\n"); return false; }
-    FName tn = {0,0}; FString tr = {0,0,0};
-    FNameToString_fn fc = (FNameToString_fn)fna;
-    __try { fc(&tn, tr); } __except(EXCEPTION_EXECUTE_HANDLER) { Log("FNameToString crashed\n"); return false; }
-    if (!tr.Data || tr.Count < 4) { Log("FNameToString didn't return 'None'\n"); return false; }
-    gFNameToString = fc;
-    Log("FNameToString: 0x%llX OK\n", fna);
+    // Find FNamePool (GNames): scan .data for &Blocks[0] — the slot whose value
+    // points at the "None" entry. Validate each candidate by resolving real
+    // UObject names from the already-found GUObjectArray through it. Read-only;
+    // replaces the hardcoded FNAME_TOSTRING_OFFSET call that crashed after the
+    // 2026-06-04 game update.
+    {
+        DWORD t0 = GetTickCount();
+        uintptr_t dEnd = gDataStart + gDataSize;
+        for (uintptr_t page = gDataStart & ~(uintptr_t)0xFFF; page < dEnd && !gNamePool; page += 0x1000) {
+            if (!IsSafeToRead((void*)page, 0x1000)) continue;
+            uintptr_t lo = page > gDataStart ? page : gDataStart;
+            uintptr_t hi = (page + 0x1000) < dEnd ? (page + 0x1000) : dEnd;
+            while (!gNamePool) {
+                uintptr_t slot = ScanForNamePoolSlot(lo, hi);
+                if (!slot) break;
+                lo = slot + 8; // resume past this slot if rejected
+                uintptr_t cand = slot - 0x10;
+                // Validate: >=5 of the first 200 live objects must resolve to a name
+                int ok = 0;
+                wchar_t vb[256];
+                for (int i = 0; i < 200 && i < gNumElements && ok < 5; i++) {
+                    void* o = GetUObject(i); if (!o || !IsSafeToRead(o, 0x20)) continue;
+                    int32_t ci = 0; if (!SafeRead32((uintptr_t)o + 0x18, &ci)) continue;
+                    if (PoolReadName(cand, (uint32_t)ci, vb, 256) && vb[0]) ok++;
+                }
+                if (ok >= 5) {
+                    gNamePool = cand;
+                    Log("FNamePool: 0x%llX (scan %lums, validated %d names)\n",
+                        cand, (unsigned long)(GetTickCount() - t0), ok);
+                } else {
+                    Log("FNamePool candidate 0x%llX rejected (%d/5 names) — continuing scan\n", cand, ok);
+                }
+            }
+        }
+        if (!gNamePool) {
+            Log("FNamePool NOT FOUND (scan %lums)\n", (unsigned long)(GetTickCount() - t0));
+            return false;
+        }
+    }
 
     return true;
 }
@@ -818,7 +904,7 @@ static DWORD WINAPI ModThreadProc(LPVOID) {
     gLogFile = fopen(lp, "w");
     if (!gLogFile) return 0;
 
-    Log("=== SanctifyEverywhere v0.9 ===\n");
+    Log("=== SanctifyEverywhere v0.10 (FNamePool reader) ===\n");
     Log("Background thread ID: %lu\n", GetCurrentThreadId());
 
     HWND gw = nullptr;

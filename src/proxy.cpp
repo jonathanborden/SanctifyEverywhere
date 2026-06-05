@@ -5,17 +5,30 @@
 static HMODULE hRealDwmapi = nullptr;
 static bool gModStarted = false;
 static FILE* gProxyLog = nullptr;
+static DWORD gProxyLogLastTick = 0;
+
+extern HMODULE gThisModule; // set in dllmain.cpp
 
 static void ProxyLog(const char* fmt, ...) {
     if (!gProxyLog) {
-        // Write to user's desktop - guaranteed writable
-        char path[MAX_PATH];
-        if (GetEnvironmentVariableA("USERPROFILE", path, MAX_PATH)) {
-            strcat_s(path, "\\Desktop\\SanctifyMod_proxy.log");
-            gProxyLog = fopen(path, "w");
+        // Write next to the deployed DLL (game's Win64 folder).
+        char path[MAX_PATH] = {};
+        if (gThisModule && GetModuleFileNameA(gThisModule, path, MAX_PATH)) {
+            char* slash = strrchr(path, '\\');
+            if (slash) *(slash + 1) = 0;
+            strcat_s(path, "SanctifyMod_proxy.log");
+        } else {
+            strcpy_s(path, ".\\SanctifyMod_proxy.log");
         }
+        gProxyLog = fopen(path, "w");
     }
     if (!gProxyLog) return;
+    SYSTEMTIME st; GetLocalTime(&st);
+    DWORD now = GetTickCount();
+    DWORD delta = gProxyLogLastTick ? (now - gProxyLogLastTick) : 0;
+    gProxyLogLastTick = now;
+    fprintf(gProxyLog, "[%02u:%02u:%02u.%03u +%lums] ",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, (unsigned long)delta);
     va_list args;
     va_start(args, fmt);
     vfprintf(gProxyLog, fmt, args);

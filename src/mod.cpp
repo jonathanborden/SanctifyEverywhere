@@ -11,6 +11,25 @@
 static std::atomic<bool> gRunning{false};
 static HANDLE gModThread = nullptr;
 FILE* gLogFile = nullptr;
+static DWORD gLogLastTick = 0; // ms tick of previous Log() call — drives the "+Δms" prefix
+
+extern HMODULE gThisModule; // set in dllmain.cpp DLL_PROCESS_ATTACH
+
+// Build an absolute path next to the deployed DLL (game's Win64 folder).
+// Falls back to current dir if module lookup fails.
+static void BuildLogPath(const char* fname, char* out, size_t outsz) {
+    out[0] = 0;
+    char mp[MAX_PATH] = {};
+    if (gThisModule && GetModuleFileNameA(gThisModule, mp, MAX_PATH)) {
+        char* slash = strrchr(mp, '\\');
+        if (slash) *(slash + 1) = 0;
+        strcpy_s(out, outsz, mp);
+        strcat_s(out, outsz, fname);
+    } else {
+        strcpy_s(out, outsz, ".\\");
+        strcat_s(out, outsz, fname);
+    }
+}
 
 // Types needed early
 struct FName { int32_t ComparisonIndex; int32_t Number; };
@@ -273,6 +292,12 @@ static void GameThreadSpawn() {
 
 void Log(const char* fmt, ...) {
     if (!gLogFile) return;
+    SYSTEMTIME st; GetLocalTime(&st);
+    DWORD now = GetTickCount();
+    DWORD delta = gLogLastTick ? (now - gLogLastTick) : 0;
+    gLogLastTick = now;
+    fprintf(gLogFile, "[%02u:%02u:%02u.%03u +%lums] ",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, (unsigned long)delta);
     va_list a; va_start(a, fmt); vfprintf(gLogFile, fmt, a); va_end(a);
     fflush(gLogFile);
 }
@@ -477,30 +502,59 @@ static const int CURRENCY_ID_OFFSET = 0x55C; // FPrimaryAssetId in WBP_Game_Curr
 // True when the current level already provides sanctify natively (zone 4):
 // the SafeRoom EncounterManager exists, or GameState bSanctifyingAvailable is set.
 static bool IsZone4Native() {
+    DWORD t0 = GetTickCount();
     wchar_t cb[256];
     for (int i = 0; i < gNumElements; i++) {
         void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
         void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
-        if (wcsstr(cb, L"EncounterManager") && wcsstr(cb, L"SafeRoom")) return true;
+        if (wcsstr(cb, L"EncounterManager") && wcsstr(cb, L"SafeRoom")) {
+            Log("[Zone4?] YES via SafeRoom EncounterManager class=%ls (scan %lums)\n",
+                cb, (unsigned long)(GetTickCount() - t0));
+            return true;
+        }
         if (wcsstr(cb, L"GameState") && wcsstr(cb, L"RogueLite")) {
             int32_t v = 0;
-            if (SafeRead32((uintptr_t)o + GAMESTATE_SANCTIFY_BOOL_OFFSET, &v) && (v & 0xFF)) return true;
+            if (SafeRead32((uintptr_t)o + GAMESTATE_SANCTIFY_BOOL_OFFSET, &v) && (v & 0xFF)) {
+                Log("[Zone4?] YES via GameState+0x%X=true class=%ls (scan %lums)\n",
+                    GAMESTATE_SANCTIFY_BOOL_OFFSET, cb, (unsigned long)(GetTickCount() - t0));
+                return true;
+            }
         }
     }
+    Log("[Zone4?] NO (scan %lums) — proceeding with anvils+vials\n",
+        (unsigned long)(GetTickCount() - t0));
     return false;
 }
 
 // Find the active gameplay World instance (a fresh one is created each level load).
-static void* FindCurrentWorld() {
-    wchar_t cb[256], nb[256];
+// `verbose` dumps every World candidate and the gameplay filter result — used by the
+// auto loop when no matching world is found, to identify safe-room / unknown maps.
+static void* FindCurrentWorld(bool verbose = false) {
+    DWORD t0 = GetTickCount();
+    wchar_t cb[256], nb[256], ob[256];
+    int worldCount = 0;
+    void* result = nullptr;
     for (int i = 0; i < gNumElements; i++) {
         void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
         void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
         if (wcscmp(cb, L"World") != 0) continue;
+        worldCount++;
         if (!GetObjectName(o, nb, 256)) continue;
-        if (wcsstr(nb, L"RogueLite") || wcsstr(nb, L"Mission")) return o;
+        bool match = wcsstr(nb, L"RogueLite") || wcsstr(nb, L"Mission");
+        if (verbose && worldCount <= 16) {
+            void* ou = GetObjOuter(o);
+            ob[0] = 0; if (ou) GetObjectName(ou, ob, 256);
+            Log("[FindWorld] cand #%d name=%ls outer=%ls match=%s\n",
+                worldCount, nb, ob, match ? "Y" : "N");
+        }
+        if (match && !result) result = o;
     }
-    return nullptr;
+    if (verbose) {
+        Log("[FindWorld] %d World candidates, %s (scan %lums)\n",
+            worldCount, result ? "MATCHED" : "no gameplay match",
+            (unsigned long)(GetTickCount() - t0));
+    }
+    return result;
 }
 
 // True if a SanctityToken currency widget already exists (native zone 4, or already added).
@@ -522,9 +576,11 @@ static bool SanctityWidgetPresent() {
 // 1 = attempted (do not retry — avoids duplicate anvils). Waits until fabricators
 // have loaded before spawning.
 static int DoSpawnAnvils() {
-    Log("=== SPAWN ANVILS ===\n");
+    DWORD spawnT0 = GetTickCount();
+    Log("=== SPAWN ANVILS === (gNumElements before refresh)\n");
     SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
     SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
+    Log("[Spawn] scanning %d objects, %d chunks\n", gNumElements, gNumChunks);
 
     void* anvilClass = nullptr;
     void* world = nullptr;
@@ -605,12 +661,17 @@ static int DoSpawnAnvils() {
             if (fa >= gTextStart && fa < gTextStart + gTextSize) freshPE = fa; }
     }
 
-    Log("Anvil=%s World=%s BS=%s FS=%s PE=%s Fabs=%d\n",
-        anvilClass?"OK":"NO", world?"OK":"NO", freshBS?"OK":"NO", freshFS?"OK":"NO",
-        freshPE?"OK":"NO", fabCount);
+    Log("[Spawn] scan done in %lums: Anvil=%s World=%s CDO=%s BS=%s FS=%s SL=%s CS=%s BP=%s PE=%s "
+        "SetSA=%s EnableSA=%s GM=%s SafeRoom=%s GS=%s PSC=%s Fabs=%d\n",
+        (unsigned long)(GetTickCount() - spawnT0),
+        anvilClass?"OK":"NO", world?"OK":"NO", freshCDO?"OK":"NO", freshBS?"OK":"NO", freshFS?"OK":"NO",
+        freshSL?"OK":"NO", freshCS?"OK":"NO", freshBP?"OK":"NO", freshPE?"OK":"NO",
+        ssaFunc?"OK":"NO", esaFunc?"OK":"NO", gmInst?"OK":"NO", srmInst?"OK":"NO",
+        gsInst?"OK":"NO", pscInst?"OK":"NO", fabCount);
 
     if (!anvilClass || !world || !freshBS || !freshFS || !freshCDO || !freshPE) {
-        Log("Missing critical objects — not ready\n"); return 0;
+        Log("[Spawn] missing critical objects — NOT READY, will retry\n");
+        return 0;
     }
 
     int sc = 0;
@@ -623,8 +684,12 @@ static int DoSpawnAnvils() {
             sc++;
         }
     }
-    if (sc == 0) { Log("No fabricators loaded yet — not ready\n"); return 0; }
+    if (sc == 0) {
+        Log("[Spawn] %d fabricators found but 0 reachable locations — NOT READY, will retry\n", fabCount);
+        return 0;
+    }
     gSpawnReq.spawnCount = sc;
+    Log("[Spawn] resolved %d/%d fabricator locations\n", sc, fabCount);
 
     gSpawnReq.bpAnvilClass = anvilClass;
     gSpawnReq.gameWorld = world;
@@ -650,26 +715,49 @@ static int DoSpawnAnvils() {
     TickHook::Uninstall();
     if (!TickHook::Install(0)) { Log("FAILED to install window timer!\n"); return 1; }
 
+    DWORD gtT0 = GetTickCount();
     TickHook::QueueOnGameThread(GameThreadSpawn);
-    for (int w = 0; w < 100 && !gSpawnReq.resultReady; w++) Sleep(50);
-    if (gSpawnReq.success) Log("*** ANVIL VISIBLE! ***\n");
-    else Log("Spawn may have failed\n");
+    int waited = 0;
+    for (int w = 0; w < 100 && !gSpawnReq.resultReady; w++) { Sleep(50); waited++; }
+    Log("[Spawn] game-thread wait: %dms (result=%s)\n",
+        waited * 50, gSpawnReq.resultReady ? (gSpawnReq.success ? "OK" : "FAIL") : "TIMEOUT");
+    if (gSpawnReq.success) Log("[Spawn] *** ANVIL VISIBLE! *** (total %lums)\n",
+        (unsigned long)(GetTickCount() - spawnT0));
+    else Log("[Spawn] may have failed (total %lums, game-thread %lums)\n",
+        (unsigned long)(GetTickCount() - spawnT0), (unsigned long)(GetTickCount() - gtT0));
     return 1;
 }
 
 // Add the SanctityToken vial widget to the live HUD. Returns 0 = not ready (retry),
 // 1 = added, 2 = already present (skip).
 static int DoAddVials() {
+    DWORD vialT0 = GetTickCount();
     Log("=== ADD VIALS ===\n");
     SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
     SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
 
-    if (SanctityWidgetPresent()) { Log("SanctityToken widget already present — skip\n"); return 2; }
+    DWORD t0 = GetTickCount();
+    if (SanctityWidgetPresent()) {
+        Log("[Vials] SanctityToken widget already present — skip (check %lums)\n",
+            (unsigned long)(GetTickCount() - t0));
+        return 2;
+    }
+    Log("[Vials] widget-present check: %lums (not present)\n",
+        (unsigned long)(GetTickCount() - t0));
 
+    t0 = GetTickCount();
     uint8_t currencyId[16] = {};
-    if (!BuildSanctityCurrencyId(currencyId)) { Log("could not resolve SanctityToken CurrencyId\n"); return 0; }
-    if (!gProcessEventAddr) { Log("ProcessEvent not available\n"); return 0; }
+    if (!BuildSanctityCurrencyId(currencyId)) {
+        Log("[Vials] could not resolve SanctityToken CurrencyId — NOT READY, will retry "
+            "(scan %lums)\n", (unsigned long)(GetTickCount() - t0));
+        return 0;
+    }
+    Log("[Vials] CurrencyId built (%lums, type/name FNames resolved)\n",
+        (unsigned long)(GetTickCount() - t0));
 
+    if (!gProcessEventAddr) { Log("[Vials] ProcessEvent not available\n"); return 0; }
+
+    t0 = GetTickCount();
     void* addCurrFunc = nullptr;
     void* container = nullptr;
     wchar_t nb[256], cb[256], ob[256];
@@ -690,9 +778,14 @@ static int DoAddVials() {
             if (ouou && GetObjectName(ouou, ob, 256) && wcsstr(ob, L"UI_Game_Visor_C")) container = o;
         }
     }
+    Log("[Vials] HUD scan %lums: addFn=%s container=%s\n",
+        (unsigned long)(GetTickCount() - t0),
+        addCurrFunc?"OK":"NO", container?"OK":"NO");
 
-    if (!addCurrFunc || !container) { Log("HUD container/func not ready (addFn=%s cont=%s)\n",
-        addCurrFunc?"OK":"NO", container?"OK":"NO"); return 0; }
+    if (!addCurrFunc || !container) {
+        Log("[Vials] HUD container/func not ready — NOT READY, will retry\n");
+        return 0;
+    }
 
     gAddReq.container = container;
     gAddReq.addCurrencyWidgetFunc = addCurrFunc;
@@ -701,10 +794,16 @@ static int DoAddVials() {
     gAddReq.done = false; gAddReq.success = false;
 
     TickHook::Uninstall();
-    if (!TickHook::Install(0)) { Log("tick hook install failed\n"); return 0; }
+    if (!TickHook::Install(0)) { Log("[Vials] tick hook install failed\n"); return 0; }
+    DWORD gtT0 = GetTickCount();
     TickHook::QueueOnGameThread(GameThreadAddCurrency);
-    for (int w = 0; w < 100 && !gAddReq.done; w++) Sleep(50);
-    Log(gAddReq.success ? "vial added OK\n" : "vial add failed\n");
+    int waited = 0;
+    for (int w = 0; w < 100 && !gAddReq.done; w++) { Sleep(50); waited++; }
+    Log("[Vials] game-thread wait: %dms (done=%s success=%s)\n",
+        waited * 50, gAddReq.done?"Y":"N", gAddReq.success?"Y":"N");
+    Log("[Vials] %s (total %lums)\n",
+        gAddReq.success ? "*** ADDED OK ***" : "ADD FAILED",
+        (unsigned long)(GetTickCount() - vialT0));
     return gAddReq.success ? 1 : 0;
 }
 
@@ -715,7 +814,7 @@ static int DoAddVials() {
 static DWORD WINAPI ModThreadProc(LPVOID) {
     Sleep(5000);
     char lp[MAX_PATH];
-    if (GetEnvironmentVariableA("USERPROFILE", lp, MAX_PATH)) strcat_s(lp, "\\Desktop\\SanctifyMod.log");
+    BuildLogPath("SanctifyMod.log", lp, MAX_PATH);
     gLogFile = fopen(lp, "w");
     if (!gLogFile) return 0;
 
@@ -750,6 +849,9 @@ idle:
             static int   autoAttempts = 0;
             static DWORD autoFirstSeen = 0;
             static DWORD autoNextScan = 0;
+            static DWORD autoNoWorldSince = 0;
+            static DWORD autoLastNoWorldDump = 0;
+            static bool  autoIdleLogged = false;
 
             DWORD now = GetTickCount();
             if ((int)(now - autoNextScan) >= 0) {
@@ -758,14 +860,40 @@ idle:
                 SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
                 SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
 
-                void* w = FindCurrentWorld();
+                // If we've had no world for a while, switch to verbose mode so we can
+                // see what World objects ARE loaded (the gameplay filter may be missing
+                // a safe-room / unknown map name).
+                bool verbose = false;
+                if (!autoWorld && autoNoWorldSince
+                    && (int)(now - autoNoWorldSince) >= 5000
+                    && (int)(now - autoLastNoWorldDump) >= 10000) {
+                    verbose = true;
+                    autoLastNoWorldDump = now;
+                    Log("[Auto] no world for %lums — dumping all World candidates\n",
+                        (unsigned long)(now - autoNoWorldSince));
+                }
+
+                DWORD scanT0 = GetTickCount();
+                void* w = FindCurrentWorld(verbose);
+                DWORD scanMs = GetTickCount() - scanT0;
                 if (w != autoWorld) {
+                    Log("[Auto] World CHANGED: 0x%llX -> 0x%llX (FindWorld scan %lums)\n",
+                        (uintptr_t)autoWorld, (uintptr_t)w, (unsigned long)scanMs);
                     autoWorld = w;
                     autoAnvilsDone = autoVialsDone = autoSkipZone4 = false;
                     autoAttempts = 0;
                     autoFirstSeen = now;
-                    if (w) Log("[Auto] New world 0x%llX — will apply after settle\n", (uintptr_t)w);
-                    else   Log("[Auto] No gameplay world (menu/loading)\n");
+                    autoIdleLogged = false;
+                    if (w) {
+                        autoNoWorldSince = 0;
+                        wchar_t wn[256] = {}, on[256] = {};
+                        GetObjectName(w, wn, 256);
+                        void* ou = GetObjOuter(w); if (ou) GetObjectName(ou, on, 256);
+                        Log("[Auto] New world name=%ls outer=%ls — will apply after 3s settle\n", wn, on);
+                    } else {
+                        autoNoWorldSince = now;
+                        Log("[Auto] No gameplay world (menu/loading/unknown-map)\n");
+                    }
                 }
 
                 if (autoWorld && !autoSkipZone4 && !(autoAnvilsDone && autoVialsDone)
@@ -776,20 +904,34 @@ idle:
                         Log("[Auto] Zone 4 (native sanctify) — skipping auto spawn/vials\n");
                     } else {
                         autoAttempts++;
+                        Log("[Auto] --- attempt %d/20 (anvils=%d vials=%d) ---\n",
+                            autoAttempts, autoAnvilsDone?1:0, autoVialsDone?1:0);
                         if (!autoAnvilsDone) {
                             int r = DoSpawnAnvils(); // waits until fabricators have loaded
-                            if (r == 1) { autoAnvilsDone = true; Log("[Auto] Anvils done\n"); }
+                            if (r == 1) { autoAnvilsDone = true; Log("[Auto] anvils marked done\n"); }
+                            else Log("[Auto] anvils returned %d — will retry\n", r);
                         }
                         if (!autoVialsDone) {
                             int r = DoAddVials();
-                            if (r != 0) { autoVialsDone = true; Log("[Auto] Vials done (r=%d)\n", r); }
+                            if (r != 0) { autoVialsDone = true; Log("[Auto] vials marked done (r=%d)\n", r); }
+                            else Log("[Auto] vials returned %d — will retry\n", r);
                         }
                         if (autoAttempts >= 20 && !(autoAnvilsDone && autoVialsDone)) {
-                            Log("[Auto] Gave up after %d attempts (anvils=%d vials=%d)\n",
+                            Log("[Auto] *** GAVE UP after %d attempts (anvils=%d vials=%d) — "
+                                "see scan logs above for missing objects ***\n",
                                 autoAttempts, autoAnvilsDone?1:0, autoVialsDone?1:0);
                             autoAnvilsDone = autoVialsDone = true;
                         }
                     }
+                }
+
+                // Heartbeat: log once when we transition into the idle state so the user
+                // can correlate "fan got quieter" with mod being done for this world.
+                if (autoWorld && !autoIdleLogged
+                    && (autoSkipZone4 || (autoAnvilsDone && autoVialsDone))) {
+                    autoIdleLogged = true;
+                    Log("[Auto] *** IDLING for this world — only world-change scan runs now "
+                        "(fan should be quieter) ***\n");
                 }
             }
         }

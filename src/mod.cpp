@@ -57,6 +57,11 @@ static uintptr_t gNamePool = 0;
 // K2_GetActorLocation is reused every frame to read fabricator positions.
 static void* gGetLocFunc = nullptr;
 
+// UClass "World" — native class, stable for the whole process lifetime. Lets
+// FindCurrentWorld match by pointer compare instead of resolving every
+// object's class name (the 1s-throttled idle scan was taking 8-20s).
+static void* gWorldClass = nullptr;
+
 // ============================================================
 // Constants (Deadzone Rogue v1.4 - stable across ASLR)
 // ============================================================
@@ -325,6 +330,18 @@ bool SafeRead32(uintptr_t a, int32_t* o) {
     __try { *o = *(int32_t*)a; return true; } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// Fast variants: SEH only, no VirtualQuery syscall. Use ONLY on pointers that
+// chain from already-validated structures (obj array chunks, UObjects, name
+// pool blocks) — all UE heap, never guard pages. The VirtualQuery in SafeRead
+// cost ~1µs per read, which multiplied into 10-20s full-object scans.
+static bool FastRead64(uintptr_t a, uintptr_t* o) {
+    __try { *o = *(uintptr_t*)a; return true; } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static bool FastRead32(uintptr_t a, int32_t* o) {
+    __try { *o = *(int32_t*)a; return true; } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 // Decode one FNameEntry from a candidate pool. Entry: u16 header (bIsWide:1,
 // LowercaseProbeHash:5, Len:10) followed by Len ANSI bytes or UTF-16 chars.
 // Block = index >> 16, byte offset = (index & 0xFFFF) * 2 (stride 2).
@@ -334,13 +351,12 @@ static bool PoolReadName(uintptr_t pool, uint32_t idx, wchar_t* buf, int sz) {
     uint32_t off = (idx & 0xFFFF) * 2;
     if (block >= 8192) return false;
     uintptr_t bp = 0;
-    if (!SafeRead64(pool + 0x10 + (uintptr_t)block * 8, &bp) || !bp) return false;
+    if (!FastRead64(pool + 0x10 + (uintptr_t)block * 8, &bp) || !bp) return false;
     int32_t h32 = 0;
-    if (!SafeRead32(bp + off, &h32)) return false;
+    if (!FastRead32(bp + off, &h32)) return false;
     uint16_t h = (uint16_t)h32;
     int wide = h & 1, len = h >> 6;
     if (len <= 0 || len >= sz || len > 1023) return false;
-    if (!IsSafeToRead((void*)(bp + off + 2), (size_t)(wide ? len * 2 : len))) return false;
     __try {
         if (wide) { memcpy(buf, (const void*)(bp + off + 2), (size_t)len * 2); buf[len] = 0; }
         else {
@@ -368,30 +384,33 @@ void* GetUObject(int32_t i) {
     int32_t ci = i / 65536, wi = i % 65536;
     if (ci >= gNumChunks) return nullptr;
     uintptr_t cb = 0, cp = 0, op = 0;
-    __try {
-        if (!SafeRead64((uintptr_t)gObjArrayBase, &cb) || !cb) return nullptr;
-        if (!SafeRead64(cb + ci * 8, &cp) || !cp) return nullptr;
-        if (!SafeRead64(cp + (uintptr_t)wi * gItemSize, &op)) return nullptr;
-        return (void*)op;
-    } __except(EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    if (!FastRead64((uintptr_t)gObjArrayBase, &cb) || !cb) return nullptr;
+    if (!FastRead64(cb + ci * 8, &cp) || !cp) return nullptr;
+    if (!FastRead64(cp + (uintptr_t)wi * gItemSize, &op)) return nullptr;
+    return (void*)op;
 }
 
 bool GetObjectName(void* obj, wchar_t* buf, int sz) {
-    if (!obj || !IsSafeToRead(obj, 0x20)) { buf[0]=0; return false; }
-    FName n; SafeRead32((uintptr_t)obj+0x18, &n.ComparisonIndex); SafeRead32((uintptr_t)obj+0x1C, &n.Number);
+    buf[0] = 0;
+    if (!obj) return false;
+    FName n;
+    if (!FastRead32((uintptr_t)obj+0x18, &n.ComparisonIndex)) return false;
+    if (!FastRead32((uintptr_t)obj+0x1C, &n.Number)) return false;
     return GetFNameStr(&n, buf, sz);
 }
 
 void* GetObjClass(void* o) {
-    if (!o || !IsSafeToRead(o, 0x18)) return nullptr;
-    uintptr_t c = 0; SafeRead64((uintptr_t)o + 0x10, &c);
-    return (c && IsSafeToRead((void*)c, 0x20)) ? (void*)c : nullptr;
+    if (!o) return nullptr;
+    uintptr_t c = 0;
+    if (!FastRead64((uintptr_t)o + 0x10, &c)) return nullptr;
+    return (void*)c;
 }
 
 void* GetObjOuter(void* o) {
-    if (!o || !IsSafeToRead(o, 0x28)) return nullptr;
-    uintptr_t u = 0; SafeRead64((uintptr_t)o + 0x20, &u);
-    return (u && IsSafeToRead((void*)u, 0x20)) ? (void*)u : nullptr;
+    if (!o) return nullptr;
+    uintptr_t u = 0;
+    if (!FastRead64((uintptr_t)o + 0x20, &u)) return nullptr;
+    return (void*)u;
 }
 
 bool IsCDO(void* o) {
@@ -550,6 +569,12 @@ static bool CacheObjects() {
         }
         if (!gameplayStaticsCDO && wcscmp(nb, L"Default__GameplayStatics") == 0)
             gameplayStaticsCDO = o;
+        if (!gWorldClass && wcscmp(nb, L"World") == 0) {
+            wchar_t cn[64];
+            void* c = GetObjClass(o);
+            if (c && GetObjectName(c, cn, 64) && wcscmp(cn, L"Class") == 0)
+                gWorldClass = o; // the native UClass named "World"
+        }
     }
 
     if (gameplayStaticsCDO) {
@@ -564,7 +589,8 @@ static bool CacheObjects() {
         }
     }
 
-    Log("Cached: GetLoc=%s PE=%s\n", gGetLocFunc?"OK":"NO", gProcessEventAddr?"OK":"NO");
+    Log("Cached: GetLoc=%s PE=%s WorldClass=%s\n",
+        gGetLocFunc?"OK":"NO", gProcessEventAddr?"OK":"NO", gWorldClass?"OK":"NO");
     return gGetLocFunc && gProcessEventAddr;
 }
 
@@ -585,30 +611,40 @@ static bool GetActorLoc(void* actor, double* x, double* y, double* z) {
 
 static const int CURRENCY_ID_OFFSET = 0x55C; // FPrimaryAssetId in WBP_Game_Currency_C body
 
-// True when the current level already provides sanctify natively (zone 4):
-// the SafeRoom EncounterManager exists, or GameState bSanctifyingAvailable is set.
-static bool IsZone4Native() {
+// True when the current level already provides sanctify natively (zone 4).
+// Decided from the world's map name: Zone4 -> native, Zone1/2/3 -> not. Only
+// for unknown map names fall back to the GameState bSanctifyingAvailable bool.
+// (The old "any SafeRoom EncounterManager instance" heuristic false-positived
+// on RogueLite_Zone1_Mission19_P, which contains one, and skipped the forge.)
+static bool IsZone4Native(void* world) {
+    wchar_t wn[256] = {};
+    if (world) GetObjectName(world, wn, 256);
+    if (wcsstr(wn, L"Zone4")) {
+        Log("[Zone4?] YES via world name %ls\n", wn);
+        return true;
+    }
+    if (wcsstr(wn, L"Zone1") || wcsstr(wn, L"Zone2") || wcsstr(wn, L"Zone3")) {
+        Log("[Zone4?] NO via world name %ls — proceeding with anvils+vials\n", wn);
+        return false;
+    }
+
+    // Unknown map name — check GameState's sanctify bool as a fallback.
     DWORD t0 = GetTickCount();
     wchar_t cb[256];
     for (int i = 0; i < gNumElements; i++) {
         void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
         void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
-        if (wcsstr(cb, L"EncounterManager") && wcsstr(cb, L"SafeRoom")) {
-            Log("[Zone4?] YES via SafeRoom EncounterManager class=%ls (scan %lums)\n",
-                cb, (unsigned long)(GetTickCount() - t0));
-            return true;
-        }
         if (wcsstr(cb, L"GameState") && wcsstr(cb, L"RogueLite")) {
             int32_t v = 0;
             if (SafeRead32((uintptr_t)o + GAMESTATE_SANCTIFY_BOOL_OFFSET, &v) && (v & 0xFF)) {
-                Log("[Zone4?] YES via GameState+0x%X=true class=%ls (scan %lums)\n",
-                    GAMESTATE_SANCTIFY_BOOL_OFFSET, cb, (unsigned long)(GetTickCount() - t0));
+                Log("[Zone4?] YES via GameState+0x%X=true class=%ls (world %ls, scan %lums)\n",
+                    GAMESTATE_SANCTIFY_BOOL_OFFSET, cb, wn, (unsigned long)(GetTickCount() - t0));
                 return true;
             }
         }
     }
-    Log("[Zone4?] NO (scan %lums) — proceeding with anvils+vials\n",
-        (unsigned long)(GetTickCount() - t0));
+    Log("[Zone4?] NO (world %ls, fallback scan %lums) — proceeding with anvils+vials\n",
+        wn, (unsigned long)(GetTickCount() - t0));
     return false;
 }
 
@@ -621,9 +657,13 @@ static void* FindCurrentWorld(bool verbose = false) {
     int worldCount = 0;
     void* result = nullptr;
     for (int i = 0; i < gNumElements; i++) {
-        void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
-        void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
-        if (wcscmp(cb, L"World") != 0) continue;
+        void* o = GetUObject(i); if (!o) continue;
+        void* c = GetObjClass(o); if (!c) continue;
+        // Cheap pointer compare against cached UClass; fall back to name match
+        // only if the class cache failed at startup.
+        if (gWorldClass) { if (c != gWorldClass) continue; }
+        else { if (!GetObjectName(c, cb, 256) || wcscmp(cb, L"World") != 0) continue; }
+        if (IsCDO(o)) continue;
         worldCount++;
         if (!GetObjectName(o, nb, 256)) continue;
         bool match = wcsstr(nb, L"RogueLite") || wcsstr(nb, L"Mission");
@@ -904,7 +944,7 @@ static DWORD WINAPI ModThreadProc(LPVOID) {
     gLogFile = fopen(lp, "w");
     if (!gLogFile) return 0;
 
-    Log("=== SanctifyEverywhere v0.10 (FNamePool reader) ===\n");
+    Log("=== SanctifyEverywhere v0.11 (fast scans, world-name zone detect) ===\n");
     Log("Background thread ID: %lu\n", GetCurrentThreadId());
 
     HWND gw = nullptr;
@@ -941,7 +981,6 @@ idle:
 
             DWORD now = GetTickCount();
             if ((int)(now - autoNextScan) >= 0) {
-                autoNextScan = now + 1000; // throttle full scans to ~1s
 
                 SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
                 SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
@@ -985,7 +1024,7 @@ idle:
                 if (autoWorld && !autoSkipZone4 && !(autoAnvilsDone && autoVialsDone)
                     && (int)(now - autoFirstSeen) >= 3000) {
 
-                    if (IsZone4Native()) {
+                    if (IsZone4Native(autoWorld)) {
                         autoSkipZone4 = true;
                         Log("[Auto] Zone 4 (native sanctify) — skipping auto spawn/vials\n");
                     } else {
@@ -1019,6 +1058,10 @@ idle:
                     Log("[Auto] *** IDLING for this world — only world-change scan runs now "
                         "(fan should be quieter) ***\n");
                 }
+
+                // Throttle from scan END so a slow scan can't restart back-to-back
+                // and peg a core indefinitely.
+                autoNextScan = GetTickCount() + 1000;
             }
         }
     }

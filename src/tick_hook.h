@@ -9,4 +9,11 @@ namespace TickHook {
     void Uninstall();
     typedef void (*TickCallback)();
     void QueueOnGameThread(TickCallback cb);
+
+    // Shutdown detection (see tick_hook.cpp). IsShuttingDown(): WM_DESTROY /
+    // WM_ENDSESSION was seen — permanent. HeartbeatAgeMs(): ms since the game
+    // thread last pumped our WM_TIMER; large = teardown or a long hitch, and
+    // UObjects must not be touched.
+    bool IsShuttingDown();
+    DWORD HeartbeatAgeMs();
 }

@@ -88,6 +88,7 @@ void* GetObjClass(void* obj);
 void* GetObjOuter(void* obj);
 bool IsCDO(void* obj);
 static bool GetFNameStr(const FName* n, wchar_t* buf, int sz);
+static bool ScanAbort();
 
 // ============================================================
 // Spawn request (background thread -> game thread)
@@ -155,6 +156,7 @@ static void GameThreadAddCurrency() {
 static bool FindFNameByObjectName(const wchar_t* target, FName* out) {
     wchar_t nb[256];
     for (int i = 0; i < gNumElements; i++) {
+        if ((i & 0x3FFF) == 0 && ScanAbort()) return false;
         void* o = GetUObject(i); if (!o || !IsSafeToRead(o, 0x20)) continue;
         FName n;
         if (!SafeRead32((uintptr_t)o + 0x18, &n.ComparisonIndex)) continue;
@@ -421,6 +423,13 @@ bool IsCDO(void* o) {
     wchar_t n[256]; return GetObjectName(o, n, 256) && wcsncmp(n, L"Default__", 9) == 0;
 }
 
+// True when a long object scan must bail out: mod stopping, or the game is
+// shutting down (objects are being destroyed under us). Checked periodically
+// inside every full-array scan so an in-flight scan can't outlive teardown.
+static bool ScanAbort() {
+    return !gRunning || TickHook::IsShuttingDown();
+}
+
 // ============================================================
 // Pattern scan (only needed once per session for GUObjectArray)
 // ============================================================
@@ -636,6 +645,7 @@ static bool IsZone4Native(void* world) {
     DWORD t0 = GetTickCount();
     wchar_t cb[256];
     for (int i = 0; i < gNumElements; i++) {
+        if ((i & 0x3FFF) == 0 && ScanAbort()) return false;
         void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
         void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
         if (wcsstr(cb, L"GameState") && wcsstr(cb, L"RogueLite")) {
@@ -661,6 +671,7 @@ static void* FindCurrentWorld(bool verbose = false) {
     int worldCount = 0;
     void* result = nullptr;
     for (int i = 0; i < gNumElements; i++) {
+        if ((i & 0x3FFF) == 0 && ScanAbort()) return nullptr;
         void* o = GetUObject(i); if (!o) continue;
         void* c = GetObjClass(o); if (!c) continue;
         // Cheap pointer compare against cached UClass; fall back to name match
@@ -725,6 +736,7 @@ static void ScanCurrencyWidgets(CurrencyScanResult* r, bool verbose) {
     void* widgets[64]; int nw = 0;
     void* containers[8]; int ncont = 0;
     for (int i = 0; i < gNumElements; i++) {
+        if ((i & 0x3FFF) == 0 && ScanAbort()) return;
         void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
         void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
         if (wcscmp(cb, L"WBP_Game_Currency_C") == 0) { if (nw < 64) widgets[nw++] = o; }
@@ -826,6 +838,7 @@ static int DoSpawnAnvils() {
     wchar_t nb[256], cb[256], ob[256];
 
     for (int i = 0; i < gNumElements; i++) {
+        if ((i & 0x3FFF) == 0 && ScanAbort()) { Log("[Spawn] scan aborted (shutdown)\n"); return 0; }
         void* o = GetUObject(i); if (!o) continue;
         if (!GetObjectName(o, nb, 256)) continue;
 
@@ -946,7 +959,6 @@ static int DoSpawnAnvils() {
     gSpawnReq.resultReady = false;
     gSpawnReq.success = false;
 
-    TickHook::Uninstall();
     if (!TickHook::Install(0)) { Log("FAILED to install window timer!\n"); return 1; }
 
     DWORD gtT0 = GetTickCount();
@@ -1002,6 +1014,7 @@ static int DoAddVials() {
     wchar_t nb[256], ob[256], cb2[64];
     static bool funcsDumped = false; // one-time class API dump for diagnostics
     for (int i = 0; i < gNumElements; i++) {
+        if ((i & 0x3FFF) == 0 && ScanAbort()) { Log("[Vials] scan aborted (shutdown)\n"); return 0; }
         void* o = GetUObject(i); if (!o) continue;
         if (!GetObjectName(o, nb, 256)) continue;
         if (!addCurrFunc && wcscmp(nb, L"AddCurrencyWidget") == 0) {
@@ -1040,7 +1053,6 @@ static int DoAddVials() {
     memcpy(gAddReq.currencyId, currencyId, 16);
     gAddReq.done = false; gAddReq.success = false;
 
-    TickHook::Uninstall();
     if (!TickHook::Install(0)) { Log("[Vials] tick hook install failed\n"); return 0; }
     DWORD gtT0 = GetTickCount();
     TickHook::QueueOnGameThread(GameThreadAddCurrency);
@@ -1081,7 +1093,7 @@ static DWORD WINAPI ModThreadProc(LPVOID) {
     if (!gLogFile) return 0;
 #endif
 
-    Log("=== SanctifyEverywhere v1.0 ===\n");
+    Log("=== SanctifyEverywhere v1.1 ===\n");
     Log("Background thread ID: %lu\n", GetCurrentThreadId());
 
     HWND gw = nullptr;
@@ -1094,11 +1106,50 @@ static DWORD WINAPI ModThreadProc(LPVOID) {
     if (!InitUE()) { Log("InitUE FAILED\n"); goto idle; }
     if (!CacheObjects()) { Log("CacheObjects FAILED\n"); goto idle; }
 
+    // Install the window subclass + timer NOW (not lazily at first spawn) so the
+    // heartbeat below works from the start. Spawn/vial paths reuse it (Install
+    // is idempotent).
+    if (!TickHook::Install(0))
+        Log("Heartbeat hook install failed — shutdown detection degraded\n");
+
     Log("\n*** READY! Auto-spawning anvils + vials on each zone 1-3 load ***\n\n");
 
 idle:
     while (gRunning) {
         Sleep(100);
+
+        // ---- SHUTDOWN DETECTION ----
+        // The 2-3 minute exit hang was this thread scanning (and worse, calling
+        // ProcessEvent on stale worlds) while the engine destroyed every UObject.
+        // Three independent signals end/pause all activity:
+        //  1. WM_DESTROY/WM_ENDSESSION on the game window -> exit thread.
+        //  2. Game window handle no longer valid -> exit thread (after a grace
+        //     period in case the window is being recreated).
+        //  3. Heartbeat stale: the game thread hasn't pumped our WM_TIMER for
+        //     >2s (teardown, or a heavy hitch) -> skip scans until it resumes.
+        if (TickHook::IsShuttingDown()) {
+            Log("[Exit] window destroy seen — mod thread exiting\n");
+            return 0;
+        }
+        if (gw && !IsWindow(gw)) {
+            static DWORD windowGoneSince = 0;
+            HWND ngw = FindWindowA("UnrealWindow", nullptr);
+            if (ngw) { // window was recreated — rebind hook to the new one
+                gw = ngw;
+                windowGoneSince = 0;
+                TickHook::Uninstall();
+                TickHook::Install(0);
+                Log("[Exit] game window recreated — rebound heartbeat hook\n");
+            } else {
+                if (!windowGoneSince) windowGoneSince = GetTickCount();
+                if (GetTickCount() - windowGoneSince >= 3000) {
+                    Log("[Exit] game window gone — mod thread exiting\n");
+                    return 0;
+                }
+                continue;
+            }
+        }
+        if (TickHook::HeartbeatAgeMs() > 2000) continue;
 
         // ---- AUTO: spawn anvils + add vials on each new level load (zones 1-3) ----
         // Runs regardless of window focus, throttled to ~1s. Detects a new gameplay
@@ -1205,10 +1256,28 @@ idle:
     return 0;
 }
 
-void Mod::Start() { gRunning = true; gModThread = CreateThread(nullptr, 0, ModThreadProc, nullptr, 0, nullptr); }
-void Mod::Stop() {
+void Mod::Start() {
+    // Idempotent: Proxy::Init() starts the mod at DLL attach AND the first
+    // proxied dwmapi call triggers EnsureModStarted() — without this guard two
+    // scanner threads were created (the first one's handle leaked).
+    if (gRunning.exchange(true)) return;
+    gModThread = CreateThread(nullptr, 0, ModThreadProc, nullptr, 0, nullptr);
+}
+
+void Mod::Stop(bool processTerminating) {
     gRunning = false;
+    if (processTerminating) {
+        // ExitProcess path: every other thread is already terminated, and we
+        // hold the loader lock. Waiting on the mod thread here always burned
+        // the full timeout (it can't deliver thread-detach while we hold the
+        // lock) — adding 5s to every game exit. Just release resources.
+        if (gModThread) { CloseHandle(gModThread); gModThread = nullptr; }
+        if (gLogFile) { fclose(gLogFile); gLogFile = nullptr; }
+        return;
+    }
+    // FreeLibrary path (doesn't happen for a statically-imported proxy, but be
+    // correct): restore the wndproc, give the thread a moment to notice gRunning.
     TickHook::Uninstall();
-    if (gModThread) { WaitForSingleObject(gModThread, 5000); CloseHandle(gModThread); }
+    if (gModThread) { WaitForSingleObject(gModThread, 1000); CloseHandle(gModThread); gModThread = nullptr; }
     if (gLogFile) { fclose(gLogFile); gLogFile = nullptr; }
 }

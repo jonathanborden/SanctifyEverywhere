@@ -8,5 +8,8 @@
 
 namespace Mod {
     void Start();
-    void Stop();
+    // processTerminating = true when called from DLL_PROCESS_DETACH at process
+    // exit (DllMain's reserved != nullptr): threads are already dead and the
+    // loader lock is held, so Stop must not wait on the mod thread.
+    void Stop(bool processTerminating);
 }

@@ -15,8 +15,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
         // Use a delayed start instead
         break;
     case DLL_PROCESS_DETACH:
-        Mod::Stop();
-        Proxy::Shutdown();
+        // reserved != nullptr -> process is terminating (the normal game-exit
+        // path). Never wait or unload libraries there; it only delays exit.
+        Mod::Stop(reserved != nullptr);
+        if (!reserved) Proxy::Shutdown();
         break;
     }
     return TRUE;

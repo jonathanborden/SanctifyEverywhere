@@ -1079,7 +1079,7 @@ static DWORD WINAPI ModThreadProc(LPVOID) {
     gLogFile = fopen(lp, "w");
     if (!gLogFile) return 0;
 
-    Log("=== SanctifyEverywhere v0.13 (live-HUD match via count + shared ancestor) ===\n");
+    Log("=== SanctifyEverywhere v1.0 ===\n");
     Log("Background thread ID: %lu\n", GetCurrentThreadId());
 
     HWND gw = nullptr;

@@ -14,7 +14,7 @@ In the base game, the **Nanite Forge** (sanctify anvil) only appears in Zone 4. 
 
 ## Installation
 
-1. Download and extract the zip.
+1. Download the latest `SanctifyEverywhere-vX.X.zip` from the [Releases page](https://github.com/jonathanborden/SanctifyEverywhere/releases) and extract it.
 2. Copy `dwmapi.dll` into the game's binaries folder:
    ```
    <Steam>\steamapps\common\Deadzone Rogue\Valhalla\Binaries\Win64\

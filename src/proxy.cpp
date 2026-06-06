@@ -10,6 +10,9 @@ static DWORD gProxyLogLastTick = 0;
 extern HMODULE gThisModule; // set in dllmain.cpp
 
 static void ProxyLog(const char* fmt, ...) {
+#if !SANCTIFY_LOGGING
+    return; // logging disabled — no file is ever created
+#endif
     if (!gProxyLog) {
         // Write next to the deployed DLL (game's Win64 folder).
         char path[MAX_PATH] = {};

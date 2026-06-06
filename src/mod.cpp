@@ -1074,10 +1074,12 @@ static int DoAddVials() {
 
 static DWORD WINAPI ModThreadProc(LPVOID) {
     Sleep(5000);
+#if SANCTIFY_LOGGING
     char lp[MAX_PATH];
     BuildLogPath("SanctifyMod.log", lp, MAX_PATH);
     gLogFile = fopen(lp, "w");
     if (!gLogFile) return 0;
+#endif
 
     Log("=== SanctifyEverywhere v1.0 ===\n");
     Log("Background thread ID: %lu\n", GetCurrentThreadId());

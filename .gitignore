@@ -1,0 +1,8 @@
+# Build intermediates
+*.obj
+*.pdb
+*.ilk
+
+# Build outputs (rebuilt from source; release zips are packaged separately)
+build/
+release/

@@ -702,65 +702,108 @@ struct CurrencyScanResult {
     void* liveContainer;   // container owning the most existing widgets
 };
 
+// Format an object's outer chain as "Name(Class) <- Name(Class) <- ..." for logs.
+static void FormatOuterChain(void* o, wchar_t* out, int outsz, int depth) {
+    out[0] = 0;
+    wchar_t nb[128], cb[128];
+    void* ou = o;
+    for (int d = 0; d < depth; d++) {
+        ou = GetObjOuter(ou); if (!ou) break;
+        nb[0] = cb[0] = 0;
+        GetObjectName(ou, nb, 128);
+        void* c = GetObjClass(ou); if (c) GetObjectName(c, cb, 128);
+        size_t l = wcslen(out);
+        swprintf_s(out + l, outsz - l, L"%s%ls(%ls)", d ? L" <- " : L"", nb, cb);
+    }
+}
+
 static void ScanCurrencyWidgets(CurrencyScanResult* r, bool verbose) {
     r->widgetCount = 0; r->sanctityPresent = false; r->liveContainer = nullptr;
-    struct { void* c; int n; } tally[8] = {};
-    wchar_t cb[256], ns[256], ts[256];
+    wchar_t cb[256], ns[256], ts[256], oc[512];
+
+    // Pass 1: collect widget + container instances.
+    void* widgets[64]; int nw = 0;
+    void* containers[8]; int ncont = 0;
     for (int i = 0; i < gNumElements; i++) {
         void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
         void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
-        if (wcscmp(cb, L"WBP_Game_Currency_C") != 0) continue;
-        r->widgetCount++;
+        if (wcscmp(cb, L"WBP_Game_Currency_C") == 0) { if (nw < 64) widgets[nw++] = o; }
+        else if (wcscmp(cb, L"WBP_Game_Currencies_C") == 0) { if (ncont < 8) containers[ncont++] = o; }
+    }
+    r->widgetCount = nw;
 
-        // Derive the FPrimaryAssetId offset from the first widget that has a
-        // valid {type="ValItemAsset", name="Item_Currency_*"} pair in its body.
-        if (!gCurrencyIdOffset) {
-            for (int off = 0x400; off <= 0x900; off += 4) {
-                FName t, n;
-                if (!FastRead32((uintptr_t)o + off + 0, &t.ComparisonIndex)) break;
-                FastRead32((uintptr_t)o + off + 4, &t.Number);
-                FastRead32((uintptr_t)o + off + 8, &n.ComparisonIndex);
-                FastRead32((uintptr_t)o + off + 12, &n.Number);
-                if (!GetFNameStr(&t, ts, 256) || wcscmp(ts, L"ValItemAsset") != 0) continue;
-                if (!GetFNameStr(&n, ns, 256) || wcsncmp(ns, L"Item_Currency_", 14) != 0) continue;
-                gCurrencyIdOffset = off;
-                Log("[Vials] derived CurrencyId offset: +0x%X (was 0x%X pre-update) via %ls\n",
-                    off, CURRENCY_ID_OFFSET, ns);
-                break;
-            }
+    // Derive the FPrimaryAssetId offset from the first widget that has a
+    // valid {type="ValItemAsset", name="Item_Currency_*"} pair in its body.
+    for (int w = 0; w < nw && !gCurrencyIdOffset; w++) {
+        void* o = widgets[w];
+        for (int off = 0x400; off <= 0x900; off += 4) {
+            FName t, n;
+            if (!FastRead32((uintptr_t)o + off + 0, &t.ComparisonIndex)) break;
+            FastRead32((uintptr_t)o + off + 4, &t.Number);
+            FastRead32((uintptr_t)o + off + 8, &n.ComparisonIndex);
+            FastRead32((uintptr_t)o + off + 12, &n.Number);
+            if (!GetFNameStr(&t, ts, 256) || wcscmp(ts, L"ValItemAsset") != 0) continue;
+            if (!GetFNameStr(&n, ns, 256) || wcsncmp(ns, L"Item_Currency_", 14) != 0) continue;
+            gCurrencyIdOffset = off;
+            Log("[Vials] derived CurrencyId offset: +0x%X (was 0x%X pre-update) via %ls\n",
+                off, CURRENCY_ID_OFFSET, ns);
+            break;
         }
+    }
 
+    // Pass 2: per widget — id, live on-screen count (id offset + 0x14, the
+    // confirmed display int), sanctity present, and track the widget with the
+    // highest count: that one is provably on the LIVE HUD (templates show 0).
+    void* liveWidget = nullptr; int liveCount = -1;
+    for (int w = 0; w < nw; w++) {
+        void* o = widgets[w];
+        ns[0] = 0;
+        int32_t cnt = 0;
         if (gCurrencyIdOffset) {
             FName n;
             if (FastRead32((uintptr_t)o + gCurrencyIdOffset + 8, &n.ComparisonIndex)
-                && FastRead32((uintptr_t)o + gCurrencyIdOffset + 12, &n.Number)
-                && GetFNameStr(&n, ns, 256)) {
-                if (wcsstr(ns, L"SanctityToken")) r->sanctityPresent = true;
-                if (verbose) Log("[Vials] widget 0x%llX id=%ls\n", (uintptr_t)o, ns);
-            }
+                && FastRead32((uintptr_t)o + gCurrencyIdOffset + 12, &n.Number))
+                GetFNameStr(&n, ns, 256);
+            FastRead32((uintptr_t)o + gCurrencyIdOffset + 0x14, &cnt);
+            if (wcsstr(ns, L"SanctityToken")) r->sanctityPresent = true;
         }
+        if (cnt > liveCount) { liveCount = cnt; liveWidget = o; }
+        if (verbose) {
+            FormatOuterChain(o, oc, 512, 4);
+            Log("[Vials] widget 0x%llX id=%ls count=%d outers: %ls\n",
+                (uintptr_t)o, ns[0] ? ns : L"?", cnt, oc);
+        }
+    }
 
-        // Walk the outer chain to the owning WBP_Game_Currencies_C and tally it.
-        void* ou = o;
-        for (int d = 0; d < 6 && ou; d++) {
-            ou = GetObjOuter(ou);
-            void* oc = ou ? GetObjClass(ou) : nullptr;
-            if (oc && GetObjectName(oc, cb, 256) && wcscmp(cb, L"WBP_Game_Currencies_C") == 0) {
-                for (int t = 0; t < 8; t++) {
-                    if (tally[t].c == ou) { tally[t].n++; break; }
-                    if (!tally[t].c) { tally[t].c = ou; tally[t].n = 1; break; }
-                }
-                break;
-            }
+    // The live container is the one sharing an outer ancestor (the visor /
+    // HUD root) with the live widget. Widgets are NOT outered to their
+    // container, so ownership can only be inferred via a common ancestor.
+    void* anc[8] = {}; int na = 0;
+    void* ou = liveWidget;
+    for (int d = 0; d < 8 && ou; d++) { ou = GetObjOuter(ou); if (ou) anc[na++] = ou; }
+    for (int ci = 0; ci < ncont && !r->liveContainer; ci++) {
+        void* cu = containers[ci];
+        for (int d = 0; d < 8 && cu; d++) {
+            cu = GetObjOuter(cu);
+            for (int a = 0; a < na; a++)
+                if (cu && cu == anc[a]) { r->liveContainer = containers[ci]; break; }
+            if (r->liveContainer) break;
         }
     }
-    int best = 0;
-    for (int t = 0; t < 8; t++) {
-        if (tally[t].c && tally[t].n > best) { best = tally[t].n; r->liveContainer = tally[t].c; }
-        if (verbose && tally[t].c)
-            Log("[Vials] container 0x%llX owns %d currency widgets\n",
-                (uintptr_t)tally[t].c, tally[t].n);
+    if (verbose) {
+        for (int ci = 0; ci < ncont; ci++) {
+            wchar_t nb[128] = {};
+            GetObjectName(containers[ci], nb, 128);
+            FormatOuterChain(containers[ci], oc, 512, 4);
+            Log("[Vials] container 0x%llX name=%ls%s outers: %ls\n",
+                (uintptr_t)containers[ci], nb,
+                containers[ci] == r->liveContainer ? L" [LIVE-MATCH]" : L"", oc);
+        }
+        Log("[Vials] liveWidget=0x%llX (count=%d) liveContainer=%s\n",
+            (uintptr_t)liveWidget, liveCount, r->liveContainer ? "matched" : "NO MATCH");
     }
+    // Fallback: no shared ancestor — use the first container so we at least try.
+    if (!r->liveContainer && ncont) r->liveContainer = containers[0];
 }
 
 // Spawn sanctified anvils at every fabricator. Returns 0 = not ready (retry later),
@@ -956,18 +999,31 @@ static int DoAddVials() {
 
     t0 = GetTickCount();
     void* addCurrFunc = nullptr;
-    wchar_t nb[256], ob[256];
+    wchar_t nb[256], ob[256], cb2[64];
+    static bool funcsDumped = false; // one-time class API dump for diagnostics
     for (int i = 0; i < gNumElements; i++) {
         void* o = GetUObject(i); if (!o) continue;
         if (!GetObjectName(o, nb, 256)) continue;
-        if (wcscmp(nb, L"AddCurrencyWidget") == 0) {
+        if (!addCurrFunc && wcscmp(nb, L"AddCurrencyWidget") == 0) {
             void* ou = GetObjOuter(o);
             if (ou && GetObjectName(ou, ob, 256) && wcsstr(ob, L"WBP_Game_Currencies_C")) {
                 addCurrFunc = o;
-                break;
+                if (funcsDumped) break;
+            }
+        }
+        if (!funcsDumped) {
+            void* c = GetObjClass(o);
+            if (c && GetObjectName(c, cb2, 64) && wcscmp(cb2, L"Function") == 0) {
+                void* ou = GetObjOuter(o);
+                if (ou && GetObjectName(ou, ob, 256)
+                    && (wcscmp(ob, L"WBP_Game_Currencies_C") == 0 || wcscmp(ob, L"WBP_Game_Currency_C") == 0)) {
+                    int32_t ps = 0; SafeRead32((uintptr_t)o + 0x58, &ps);
+                    Log("[Vials] fn %ls::%ls PS=%d\n", ob, nb, ps);
+                }
             }
         }
     }
+    funcsDumped = true;
     int32_t addPS = 0;
     if (addCurrFunc) SafeRead32((uintptr_t)addCurrFunc + 0x58, &addPS);
     Log("[Vials] HUD scan %lums: addFn=%s (PropertiesSize=%d, was 73 pre-update)\n",
@@ -1023,7 +1079,7 @@ static DWORD WINAPI ModThreadProc(LPVOID) {
     gLogFile = fopen(lp, "w");
     if (!gLogFile) return 0;
 
-    Log("=== SanctifyEverywhere v0.12 (verified vial add, live-container detect) ===\n");
+    Log("=== SanctifyEverywhere v0.13 (live-HUD match via count + shared ancestor) ===\n");
     Log("Background thread ID: %lu\n", GetCurrentThreadId());
 
     HWND gw = nullptr;

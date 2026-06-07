@@ -1081,6 +1081,143 @@ static int DoAddVials() {
 }
 
 // ============================================================
+// DIAGNOSTIC: synergy-system state dump (READ-ONLY)
+// ------------------------------------------------------------
+// Synergies are a player-UPGRADE mechanic (no actor to spawn). The game gates
+// them by zone: PlayerUpgradeConfig maps Mission.Zone.N -> PlayerUpgrades_ZoneN,
+// and only PlayerUpgrades_Zone3 lists any Synergy_* assets. So the live
+// ValPlayerUpgradeComponent in zones 1-2 has an empty synergy set.
+//
+// This dump runs once per world in EVERY zone. Capture one Zone 3 log (synergies
+// work) and one Zone 1 log (absent); the diff reveals the injection target:
+//   - whether Synergy_* / PlayerUpgrades_Zone3 assets are even resident in memory
+//     (if not, injection must force-load them first)
+//   - the live ValPlayerUpgradeComponent and which of its fields point at synergy
+//     / config assets (UpgradeConfig, SynergyAssetMap entries)
+//   - UFunctions on the upgrade component / player state / loot widget — candidate
+//     entry points for adding a synergy and refreshing the UI
+// Nothing here writes game memory.
+// ============================================================
+
+static void HexDumpToLog(const char* tag, void* base, int len) {
+    if (!IsSafeToRead(base, len)) {
+        Log("[Dump] %s @0x%llX UNREADABLE\n", tag, (uintptr_t)base);
+        return;
+    }
+    char line[200];
+    for (int o = 0; o < len; o += 16) {
+        int n = sprintf_s(line, sizeof(line), "[Dump] %s +0x%03X:", tag, o);
+        for (int b = 0; b < 16 && o + b < len; b++)
+            n += sprintf_s(line + n, sizeof(line) - n, " %02X", ((uint8_t*)base)[o + b]);
+        Log("%s\n", line);
+    }
+}
+
+static int DoDumpSynergies() {
+    Log("===== SYNERGY DIAGNOSTIC DUMP =====\n");
+    SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
+    SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
+
+    void* world = FindCurrentWorld(false);
+    wchar_t wn[256] = {}; if (world) GetObjectName(world, wn, 256);
+    Log("[Dump] world=%ls  (%d objects)\n", wn[0] ? wn : L"?", gNumElements);
+
+    void* upgComps[16]; int nUpg = 0;
+    void* playerStates[16]; int nPS = 0;
+    void* lootSel[8]; int nLoot = 0;
+    void* synAssets[64]; int nSyn = 0; int synTotal = 0;
+    void* zoneCfg[8]; wchar_t zoneCfgName[8][64]; int nZoneCfg = 0;
+    void* masterCfg = nullptr;
+
+    wchar_t nb[256], cb[256], ob[256];
+
+    // Pass 1: collect named assets + class instances.
+    for (int i = 0; i < gNumElements; i++) {
+        if ((i & 0x3FFF) == 0 && ScanAbort()) { Log("[Dump] aborted (shutdown)\n"); return 0; }
+        void* o = GetUObject(i); if (!o) continue;
+        if (!GetObjectName(o, nb, 256)) continue;
+
+        if (!masterCfg && wcscmp(nb, L"PlayerUpgradeConfig") == 0 && !IsCDO(o)) masterCfg = o;
+        if (wcsncmp(nb, L"PlayerUpgrades_Zone", 19) == 0 && nZoneCfg < 8) {
+            zoneCfg[nZoneCfg] = o; wcscpy_s(zoneCfgName[nZoneCfg], 64, nb); nZoneCfg++;
+        }
+        if (wcsncmp(nb, L"Synergy_", 8) == 0) {
+            synTotal++;
+            if (nSyn < 64) synAssets[nSyn++] = o;
+        }
+
+        if (IsCDO(o)) continue;
+        void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
+        if (wcscmp(cb, L"ValPlayerUpgradeComponent") == 0 && !wcsstr(nb, L"GEN_VARIABLE")
+            && nUpg < 16) upgComps[nUpg++] = o;
+        else if (wcscmp(cb, L"ValPlayerState") == 0 && nPS < 16) playerStates[nPS++] = o;
+        else if (wcscmp(cb, L"WBP_LootSelection_C") == 0 && nLoot < 8) lootSel[nLoot++] = o;
+    }
+
+    Log("[Dump] assets: Synergy_*=%d (showing up to 8), PlayerUpgrades_Zone*=%d, "
+        "PlayerUpgradeConfig=%s\n", synTotal, nZoneCfg, masterCfg ? "LOADED" : "absent");
+    for (int i = 0; i < nZoneCfg; i++)
+        Log("[Dump]   zoneCfg %ls @0x%llX\n", zoneCfgName[i], (uintptr_t)zoneCfg[i]);
+    for (int i = 0; i < nSyn && i < 8; i++) {
+        GetObjectName(synAssets[i], nb, 256);
+        Log("[Dump]   synAsset %ls @0x%llX\n", nb, (uintptr_t)synAssets[i]);
+    }
+    Log("[Dump] instances: ValPlayerUpgradeComponent=%d ValPlayerState=%d WBP_LootSelection=%d\n",
+        nUpg, nPS, nLoot);
+
+    // Per upgrade component: which fields point at synergy/config assets, plus a
+    // raw window for offline byte-diff (locates the SynergyAssetMap TMap + bUses flags).
+    for (int u = 0; u < nUpg; u++) {
+        void* comp = upgComps[u];
+        Log("[Dump] --- UpgradeComponent #%d @0x%llX ---\n", u, (uintptr_t)comp);
+        for (int off = 0x28; off <= 0x600; off += 8) {
+            uintptr_t p = 0; if (!FastRead64((uintptr_t)comp + off, &p) || !p) continue;
+            if (!IsSafeToRead((void*)p, 0x30)) continue;
+            wchar_t tn[256];
+            if (GetObjectName((void*)p, tn, 256) &&
+                (wcsncmp(tn, L"Synergy_", 8) == 0 || wcsncmp(tn, L"PlayerUpgrade", 13) == 0
+                 || wcsstr(tn, L"Synergy")))
+                Log("[Dump]   +0x%03X -> 0x%llX %ls\n", off, (uintptr_t)p, tn);
+        }
+        HexDumpToLog("UpgComp", comp, 0x400);
+    }
+
+    // ValPlayerState window — r_SynergyIds lives here (non-empty once synergies activate).
+    for (int s = 0; s < nPS && s < 2; s++) {
+        Log("[Dump] --- ValPlayerState #%d @0x%llX ---\n", s, (uintptr_t)playerStates[s]);
+        HexDumpToLog("PlayerState", playerStates[s], 0x300);
+    }
+
+    // WBP_LootSelection (only present when the loot screen is open) — bUsesSynergies bool.
+    for (int l = 0; l < nLoot; l++) {
+        Log("[Dump] --- WBP_LootSelection #%d @0x%llX ---\n", l, (uintptr_t)lootSel[l]);
+        HexDumpToLog("LootSel", lootSel[l], 0x300);
+    }
+
+    // Pass 2: UFunctions on the key classes — injection entry-point candidates.
+    const wchar_t* fnTargets[] = { L"ValPlayerUpgradeComponent", L"ValPlayerState",
+                                   L"WBP_LootSelection_C", L"WBP_SynergyListView_C" };
+    for (int i = 0; i < gNumElements; i++) {
+        if ((i & 0x3FFF) == 0 && ScanAbort()) return 0;
+        void* o = GetUObject(i); if (!o) continue;
+        void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
+        if (wcscmp(cb, L"Function") != 0) continue;
+        void* ou = GetObjOuter(o); if (!ou || !GetObjectName(ou, ob, 256)) continue;
+        for (const wchar_t* t : fnTargets) {
+            if (wcscmp(ob, t) == 0) {
+                GetObjectName(o, nb, 256);
+                int32_t ps = 0; SafeRead32((uintptr_t)o + 0x58, &ps);
+                Log("[Dump] fn %ls::%ls ParmsSize=%d\n", ob, nb, ps);
+                break;
+            }
+        }
+    }
+
+    Log("===== END SYNERGY DUMP =====\n");
+    return 1;
+}
+
+// ============================================================
 // Main thread
 // ============================================================
 
@@ -1093,7 +1230,7 @@ static DWORD WINAPI ModThreadProc(LPVOID) {
     if (!gLogFile) return 0;
 #endif
 
-    Log("=== SanctifyEverywhere v1.1 ===\n");
+    Log("=== SanctifyEverywhere v1.1 [SYNERGY DIAGNOSTIC BUILD] ===\n");
     Log("Background thread ID: %lu\n", GetCurrentThreadId());
 
     HWND gw = nullptr;
@@ -1166,6 +1303,7 @@ idle:
             static DWORD autoNoWorldSince = 0;
             static DWORD autoLastNoWorldDump = 0;
             static bool  autoIdleLogged = false;
+            static bool  autoDumpDone = false; // synergy diagnostic, once per world
 
             DWORD now = GetTickCount();
             if ((int)(now - autoNextScan) >= 0) {
@@ -1197,6 +1335,7 @@ idle:
                     autoAttempts = 0;
                     autoFirstSeen = now;
                     autoIdleLogged = false;
+                    autoDumpDone = false;
                     if (w) {
                         autoNoWorldSince = 0;
                         wchar_t wn[256] = {}, on[256] = {};
@@ -1208,6 +1347,15 @@ idle:
                         Log("[Auto] No gameplay world (menu/loading/unknown-map)\n");
                     }
                 }
+
+                // SYNERGY DIAGNOSTIC: dump once per world in EVERY zone (incl. zone
+                // 3/4 reference). Read-only; compiled out unless logging is enabled.
+#if SANCTIFY_LOGGING
+                if (autoWorld && !autoDumpDone && (int)(now - autoFirstSeen) >= 3000) {
+                    autoDumpDone = true;
+                    DoDumpSynergies();
+                }
+#endif
 
                 if (autoWorld && !autoSkipZone4 && !(autoAnvilsDone && autoVialsDone)
                     && (int)(now - autoFirstSeen) >= 3000) {

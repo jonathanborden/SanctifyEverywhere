@@ -1113,104 +1113,136 @@ static void HexDumpToLog(const char* tag, void* base, int len) {
     }
 }
 
+// UE 5.5 reflection (FField/UStruct) offsets — validated at runtime by resolving
+// a known bool (bComponentReady should read 0/1). Lets us get exact property byte
+// offsets BY NAME instead of guessing, and reused later to drive the injection.
+static const int USTRUCT_SUPER         = 0x40; // UStruct::SuperStruct
+static const int USTRUCT_CHILDPROPS    = 0x50; // UStruct::ChildProperties (FField*)
+static const int FFIELD_NEXT           = 0x20; // FField::Next
+static const int FFIELD_NAME           = 0x28; // FField::NamePrivate (FName)
+static const int FPROP_OFFSET_INTERNAL = 0x4C; // FProperty::Offset_Internal (int32)
+
+// Walk a UClass/UScriptStruct's FProperty chain (+ SuperStruct) for `propName`;
+// return its byte offset within an instance, or -1 if not found. classObj is
+// typically GetObjClass(instance). Read-only, SEH-guarded via Fast* reads.
+static int GetPropOffset(void* classObj, const wchar_t* propName) {
+    wchar_t nb[256];
+    uintptr_t st = (uintptr_t)classObj;
+    for (int depth = 0; st && depth < 16; depth++) {
+        uintptr_t field = 0;
+        if (!FastRead64(st + USTRUCT_CHILDPROPS, &field)) break;
+        for (int guard = 0; field && guard < 8192; guard++) {
+            FName n{};
+            if (FastRead32(field + FFIELD_NAME, &n.ComparisonIndex)
+                && FastRead32(field + FFIELD_NAME + 4, &n.Number)
+                && GetFNameStr(&n, nb, 256) && wcscmp(nb, propName) == 0) {
+                int32_t off = -1; FastRead32(field + FPROP_OFFSET_INTERNAL, &off);
+                return off;
+            }
+            if (!FastRead64(field + FFIELD_NEXT, &field)) break;
+        }
+        if (!FastRead64(st + USTRUCT_SUPER, &st)) break;
+    }
+    return -1;
+}
+
+// Read a TArray/TMap (FScriptArray/FScriptMap both start with {void* Data; int32
+// Num; int32 Max}) header at instance+off. Returns Num (element count), -1 if bad.
+static int ReadContainerNum(void* inst, int off) {
+    if (off < 0) return -1;
+    int32_t num = 0;
+    if (!FastRead32((uintptr_t)inst + off + 8, &num)) return -1;
+    return num;
+}
+
 static int DoDumpSynergies() {
     Log("===== SYNERGY DIAGNOSTIC DUMP =====\n");
     SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
     SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
 
-    void* world = FindCurrentWorld(false);
-    wchar_t wn[256] = {}; if (world) GetObjectName(world, wn, 256);
-    Log("[Dump] world=%ls  (%d objects)\n", wn[0] ? wn : L"?", gNumElements);
-
     void* upgComps[16]; int nUpg = 0;
     void* playerStates[16]; int nPS = 0;
     void* lootSel[8]; int nLoot = 0;
-    void* synAssets[64]; int nSyn = 0; int synTotal = 0;
-    void* zoneCfg[8]; wchar_t zoneCfgName[8][64]; int nZoneCfg = 0;
-    void* masterCfg = nullptr;
+    int nSynListView = 0, nActiveSynList = 0; // synergy-UI widget instances
+    int synTotal = 0;
+    wchar_t zoneWorlds[8][96]; int nZoneWorlds = 0; // World instances naming a zone
 
-    wchar_t nb[256], cb[256], ob[256];
+    wchar_t nb[256], cb[256];
 
-    // Pass 1: collect named assets + class instances.
+    // Pass 1: count assets, collect the instances we read values from, and note
+    // which zone-named World objects are loaded (so the log self-labels the zone).
     for (int i = 0; i < gNumElements; i++) {
         if ((i & 0x3FFF) == 0 && ScanAbort()) { Log("[Dump] aborted (shutdown)\n"); return 0; }
         void* o = GetUObject(i); if (!o) continue;
         if (!GetObjectName(o, nb, 256)) continue;
-
-        if (!masterCfg && wcscmp(nb, L"PlayerUpgradeConfig") == 0 && !IsCDO(o)) masterCfg = o;
-        if (wcsncmp(nb, L"PlayerUpgrades_Zone", 19) == 0 && nZoneCfg < 8) {
-            zoneCfg[nZoneCfg] = o; wcscpy_s(zoneCfgName[nZoneCfg], 64, nb); nZoneCfg++;
-        }
-        if (wcsncmp(nb, L"Synergy_", 8) == 0) {
-            synTotal++;
-            if (nSyn < 64) synAssets[nSyn++] = o;
-        }
+        if (wcsncmp(nb, L"Synergy_", 8) == 0) synTotal++;
 
         if (IsCDO(o)) continue;
         void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
+
+        if (wcscmp(cb, L"World") == 0 && wcsstr(nb, L"Zone") && nZoneWorlds < 8)
+            wcscpy_s(zoneWorlds[nZoneWorlds++], 96, nb);
+
         if (wcscmp(cb, L"ValPlayerUpgradeComponent") == 0 && !wcsstr(nb, L"GEN_VARIABLE")
             && nUpg < 16) upgComps[nUpg++] = o;
-        else if (wcscmp(cb, L"ValPlayerState") == 0 && nPS < 16) playerStates[nPS++] = o;
+        // PlayerState instance is a BP/native subclass — match by suffix; the
+        // property walk climbs SuperStruct so r_SynergyIds still resolves.
+        else if (wcsstr(cb, L"PlayerState") && !wcsstr(cb, L"Base") && nPS < 16) playerStates[nPS++] = o;
         else if (wcscmp(cb, L"WBP_LootSelection_C") == 0 && nLoot < 8) lootSel[nLoot++] = o;
+        else if (wcscmp(cb, L"WBP_SynergyListView_C") == 0) nSynListView++;
+        else if (wcscmp(cb, L"WBP_ActiveSynergyList_C") == 0) nActiveSynList++;
     }
 
-    Log("[Dump] assets: Synergy_*=%d (showing up to 8), PlayerUpgrades_Zone*=%d, "
-        "PlayerUpgradeConfig=%s\n", synTotal, nZoneCfg, masterCfg ? "LOADED" : "absent");
-    for (int i = 0; i < nZoneCfg; i++)
-        Log("[Dump]   zoneCfg %ls @0x%llX\n", zoneCfgName[i], (uintptr_t)zoneCfg[i]);
-    for (int i = 0; i < nSyn && i < 8; i++) {
-        GetObjectName(synAssets[i], nb, 256);
-        Log("[Dump]   synAsset %ls @0x%llX\n", nb, (uintptr_t)synAssets[i]);
-    }
-    Log("[Dump] instances: ValPlayerUpgradeComponent=%d ValPlayerState=%d WBP_LootSelection=%d\n",
-        nUpg, nPS, nLoot);
+    Log("[Dump] zone-worlds loaded: %d%s\n", nZoneWorlds, nZoneWorlds ? "" : " (none — likely a hub/ship)");
+    for (int i = 0; i < nZoneWorlds; i++) Log("[Dump]   world: %ls\n", zoneWorlds[i]);
+    Log("[Dump] assets: Synergy_*=%d resident\n", synTotal);
+    Log("[Dump] instances: UpgradeComponent=%d PlayerState=%d LootSelection=%d "
+        "SynergyListView=%d ActiveSynergyList=%d\n",
+        nUpg, nPS, nLoot, nSynListView, nActiveSynList);
 
-    // Per upgrade component: which fields point at synergy/config assets, plus a
-    // raw window for offline byte-diff (locates the SynergyAssetMap TMap + bUses flags).
+    // --- DECISIVE: live synergy state read by NAME via reflection offsets ---
+    // SynergyAssetMap.Num == 0 in zones 1-2 and > 0 in zones 3-4 would prove the
+    // run-pool gate. bComponentReady validates the reflection walk (must be 0/1).
     for (int u = 0; u < nUpg; u++) {
         void* comp = upgComps[u];
-        Log("[Dump] --- UpgradeComponent #%d @0x%llX ---\n", u, (uintptr_t)comp);
-        for (int off = 0x28; off <= 0x600; off += 8) {
-            uintptr_t p = 0; if (!FastRead64((uintptr_t)comp + off, &p) || !p) continue;
-            if (!IsSafeToRead((void*)p, 0x30)) continue;
-            wchar_t tn[256];
-            if (GetObjectName((void*)p, tn, 256) &&
-                (wcsncmp(tn, L"Synergy_", 8) == 0 || wcsncmp(tn, L"PlayerUpgrade", 13) == 0
-                 || wcsstr(tn, L"Synergy")))
-                Log("[Dump]   +0x%03X -> 0x%llX %ls\n", off, (uintptr_t)p, tn);
+        void* cls = GetObjClass(comp);
+        int offReady = GetPropOffset(cls, L"bComponentReady");
+        int offMap   = GetPropOffset(cls, L"SynergyAssetMap");
+        int offGrpsByType = GetPropOffset(cls, L"UpgradeGroupsByType");
+        int offCfg   = GetPropOffset(cls, L"UpgradeConfig");
+        int32_t ready = -1; if (offReady >= 0) FastRead32((uintptr_t)comp + offReady, &ready);
+        Log("[Dump] UpgComp #%d @0x%llX offsets: bComponentReady@0x%X=%d  "
+            "SynergyAssetMap@0x%X  UpgradeGroupsByType@0x%X  UpgradeConfig@0x%X\n",
+            u, (uintptr_t)comp, offReady, ready & 0xFF, offMap, offGrpsByType, offCfg);
+        Log("[Dump]   *** SynergyAssetMap.Num=%d   UpgradeGroupsByType.Num=%d ***\n",
+            ReadContainerNum(comp, offMap), ReadContainerNum(comp, offGrpsByType));
+        if (offCfg >= 0) {
+            uintptr_t p = 0; FastRead64((uintptr_t)comp + offCfg, &p);
+            wchar_t tn[128] = {}; if (p) GetObjectName((void*)p, tn, 128);
+            Log("[Dump]   UpgradeConfig -> 0x%llX %ls\n", (uintptr_t)p, tn[0] ? tn : L"(null)");
         }
-        HexDumpToLog("UpgComp", comp, 0x400);
+        HexDumpToLog("UpgComp", comp, 0x240); // window around the map for offline check
     }
 
-    // ValPlayerState window — r_SynergyIds lives here (non-empty once synergies activate).
+    // PlayerState: r_SynergyIds / CachedSynergyIds counts (non-empty once active).
     for (int s = 0; s < nPS && s < 2; s++) {
-        Log("[Dump] --- ValPlayerState #%d @0x%llX ---\n", s, (uintptr_t)playerStates[s]);
-        HexDumpToLog("PlayerState", playerStates[s], 0x300);
+        void* ps = playerStates[s];
+        void* cls = GetObjClass(ps);
+        GetObjectName(cls, cb, 256);
+        int offR = GetPropOffset(cls, L"r_SynergyIds");
+        int offC = GetPropOffset(cls, L"CachedSynergyIds");
+        Log("[Dump] PlayerState #%d class=%ls r_SynergyIds@0x%X Num=%d  CachedSynergyIds@0x%X Num=%d\n",
+            s, cb, offR, ReadContainerNum(ps, offR), offC, ReadContainerNum(ps, offC));
     }
 
-    // WBP_LootSelection (only present when the loot screen is open) — bUsesSynergies bool.
+    // LootSelection (present only while the loot/upgrade screen is open):
+    // bUsesSynergies bool — the UI gate.
     for (int l = 0; l < nLoot; l++) {
-        Log("[Dump] --- WBP_LootSelection #%d @0x%llX ---\n", l, (uintptr_t)lootSel[l]);
-        HexDumpToLog("LootSel", lootSel[l], 0x300);
-    }
-
-    // Pass 2: UFunctions on the key classes — injection entry-point candidates.
-    const wchar_t* fnTargets[] = { L"ValPlayerUpgradeComponent", L"ValPlayerState",
-                                   L"WBP_LootSelection_C", L"WBP_SynergyListView_C" };
-    for (int i = 0; i < gNumElements; i++) {
-        if ((i & 0x3FFF) == 0 && ScanAbort()) return 0;
-        void* o = GetUObject(i); if (!o) continue;
-        void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
-        if (wcscmp(cb, L"Function") != 0) continue;
-        void* ou = GetObjOuter(o); if (!ou || !GetObjectName(ou, ob, 256)) continue;
-        for (const wchar_t* t : fnTargets) {
-            if (wcscmp(ob, t) == 0) {
-                GetObjectName(o, nb, 256);
-                int32_t ps = 0; SafeRead32((uintptr_t)o + 0x58, &ps);
-                Log("[Dump] fn %ls::%ls ParmsSize=%d\n", ob, nb, ps);
-                break;
-            }
-        }
+        void* w = lootSel[l];
+        int off = GetPropOffset(GetObjClass(w), L"bUsesSynergies");
+        int32_t v = -1; if (off >= 0) FastRead32((uintptr_t)w + off, &v);
+        Log("[Dump] LootSelection #%d @0x%llX bUsesSynergies@0x%X = %d\n",
+            l, (uintptr_t)w, off, v & 0xFF);
     }
 
     Log("===== END SYNERGY DUMP =====\n");

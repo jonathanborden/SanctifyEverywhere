@@ -1115,76 +1115,89 @@ static void HexDumpToLog(const char* tag, void* base, int len) {
 
 // FProperty::Offset_Internal is stable at 0x4C across UE5. Everything else in
 // the FField/UStruct layout moved in this build, so we CALIBRATE it at runtime
-// by probing a class with a known property (a game update can't silently break
-// the walk, and the fallback dumps the raw nodes).
+// against two known properties that MUST land at different sane offsets (a
+// single sentinel can match spuriously). Super@0x40 is confirmed from class hex.
 static const int FPROP_OFFSET_INTERNAL = 0x4C; // FProperty::Offset_Internal (int32)
+static const int USTRUCT_SUPER         = 0x40; // UStruct::SuperStruct (confirmed)
 static int gUStructChildProps = -1; // calibrated UStruct::ChildProperties
-static int gUStructSuper       = -1; // calibrated UStruct::SuperStruct
 static int gFFieldName = -1;         // calibrated FField::NamePrivate
 static int gFFieldNext = -1;         // calibrated FField::Next
 
-// Resolve a property offset by name using the CALIBRATED layout globals
-// (gUStructChildProps/gUStructSuper/gFFieldName/gFFieldNext). -1 if not found.
-static int GetPropOffset(void* classObj, const wchar_t* propName) {
-    if (gUStructChildProps < 0) return -1;
+// Walk classObj's property chain (+ supers) with explicit layout offsets; return
+// the byte offset of propName within an instance, or -1.
+static int WalkFor(void* classObj, int childOff, int nameOff, int nextOff, const wchar_t* propName) {
     wchar_t nb[256];
     uintptr_t st = (uintptr_t)classObj;
     for (int depth = 0; st && depth < 24; depth++) {
         uintptr_t field = 0;
-        if (!FastRead64(st + gUStructChildProps, &field)) break;
+        if (!FastRead64(st + childOff, &field)) break;
         for (int guard = 0; field && guard < 8192; guard++) {
             FName n{};
-            if (FastRead32(field + gFFieldName, &n.ComparisonIndex)
-                && FastRead32(field + gFFieldName + 4, &n.Number)
+            if (FastRead32(field + nameOff, &n.ComparisonIndex)
+                && FastRead32(field + nameOff + 4, &n.Number)
                 && GetFNameStr(&n, nb, 256) && wcscmp(nb, propName) == 0) {
                 int32_t off = -1; FastRead32(field + FPROP_OFFSET_INTERNAL, &off);
                 return off;
             }
-            if (!FastRead64(field + gFFieldNext, &field)) break;
+            if (!FastRead64(field + nextOff, &field)) break;
         }
-        if (!FastRead64(st + gUStructSuper, &st)) break;
+        if (!FastRead64(st + USTRUCT_SUPER, &st)) break;
     }
     return -1;
 }
 
-// Find UStruct::ChildProperties + FField::NamePrivate/Next offsets by brute
-// force: accept the first combo where `sentinelClass`'s ChildProperties list
-// contains a field resolving to `sentinelProp`. Reads name at the trial offset.
-static bool CalibratePropLayout(void* sentinelClass, const wchar_t* sentinelProp) {
+static int GetPropOffset(void* classObj, const wchar_t* propName) {
+    if (gUStructChildProps < 0) return -1;
+    return WalkFor(classObj, gUStructChildProps, gFFieldName, gFFieldNext, propName);
+}
+
+// Dump the raw bytes of the ChildProperties head node + probe every 4-byte slot
+// as an FName, so the true NamePrivate/Next offsets can be read off the log even
+// if every calibration combo fails.
+static void AnalyzeHeadField(void* classObj) {
+    for (int co = 0x48; co <= 0x58; co += 8) {
+        uintptr_t head = 0;
+        if (!FastRead64((uintptr_t)classObj + co, &head) || !head) continue;
+        if (head < 0x10000 || (head & 0xFFF0000000000000ULL)) continue;
+        Log("[Dump]   ChildProps?@0x%X head=0x%llX:\n", co, (uintptr_t)head);
+        HexDumpToLog("    field", (void*)head, 0x50);
+        for (int o = 0x08; o <= 0x40; o += 4) {
+            FName n{};
+            if (!FastRead32(head + o, &n.ComparisonIndex)) continue;
+            FastRead32(head + o + 4, &n.Number);
+            wchar_t fn[128];
+            if (GetFNameStr(&n, fn, 128) && fn[0] && fn[0] > 32)
+                Log("[Dump]       name?@+0x%02X = %ls\n", o, fn);
+        }
+    }
+}
+
+// Calibrate (ChildProperties, FFieldName, FFieldNext) by requiring TWO known
+// props of sentinelClass to resolve to DIFFERENT, sane offsets — this rejects
+// the degenerate combos where everything maps to one bogus offset.
+static bool CalibratePropLayout(void* sentinelClass, const wchar_t* s1, const wchar_t* s2) {
     if (gUStructChildProps >= 0) return true;
     const int childCands[] = { 0x50, 0x48, 0x58, 0x40, 0x60, 0x68, 0x70 };
-    const int nameCands[]  = { 0x28, 0x20, 0x18, 0x30, 0x10 };
-    const int nextCands[]  = { 0x20, 0x18, 0x28, 0x10 };
-    wchar_t nb[256];
-    for (int ci = 0; ci < (int)(sizeof(childCands)/sizeof(int)); ci++) {
-        uintptr_t head = 0;
-        if (!FastRead64((uintptr_t)sentinelClass + childCands[ci], &head) || !head) continue;
-        if (head < 0x10000 || (head & 0xFFF0000000000000ULL)) continue; // sane heap ptr
+    const int nameCands[]  = { 0x28, 0x20, 0x18, 0x30, 0x10, 0x08 };
+    const int nextCands[]  = { 0x20, 0x18, 0x28, 0x10, 0x08 };
+    for (int ci = 0; ci < (int)(sizeof(childCands)/sizeof(int)); ci++)
         for (int ni = 0; ni < (int)(sizeof(nameCands)/sizeof(int)); ni++)
             for (int xi = 0; xi < (int)(sizeof(nextCands)/sizeof(int)); xi++) {
                 if (nameCands[ni] == nextCands[xi]) continue;
-                // Walk this list looking for the sentinel name.
-                uintptr_t f = head; bool hit = false;
-                for (int g = 0; f && g < 4096; g++) {
-                    FName n{};
-                    if (FastRead32(f + nameCands[ni], &n.ComparisonIndex)
-                        && FastRead32(f + nameCands[ni] + 4, &n.Number)
-                        && GetFNameStr(&n, nb, 256) && wcscmp(nb, sentinelProp) == 0) { hit = true; break; }
-                    if (!FastRead64(f + nextCands[xi], &f)) break;
-                }
-                if (hit) {
-                    gUStructChildProps = childCands[ci];
-                    gFFieldName = nameCands[ni];
-                    gFFieldNext = nextCands[xi];
-                    gUStructSuper = 0x40; // confirmed from class hex (super @0x40)
-                    Log("[Dump] reflection CALIBRATED: ChildProperties@0x%X FFieldName@0x%X "
-                        "FFieldNext@0x%X Super@0x%X (sentinel %ls found)\n",
-                        gUStructChildProps, gFFieldName, gFFieldNext, gUStructSuper, sentinelProp);
-                    return true;
-                }
+                int o1 = WalkFor(sentinelClass, childCands[ci], nameCands[ni], nextCands[xi], s1);
+                if (o1 < 0 || o1 >= 0x4000) continue;
+                int o2 = WalkFor(sentinelClass, childCands[ci], nameCands[ni], nextCands[xi], s2);
+                if (o2 < 0 || o2 >= 0x4000 || o1 == o2) continue; // must differ → real layout
+                gUStructChildProps = childCands[ci];
+                gFFieldName = nameCands[ni];
+                gFFieldNext = nextCands[xi];
+                Log("[Dump] reflection CALIBRATED: ChildProperties@0x%X FFieldName@0x%X "
+                    "FFieldNext@0x%X (%ls@0x%X, %ls@0x%X)\n",
+                    gUStructChildProps, gFFieldName, gFFieldNext, s1, o1, s2, o2);
+                return true;
             }
-    }
-    Log("[Dump] reflection calibration FAILED for sentinel %ls — dumping FField nodes\n", sentinelProp);
+    Log("[Dump] reflection calibration FAILED — dumping FField nodes for offline decode\n");
+    AnalyzeHeadField(sentinelClass);
     return false;
 }
 
@@ -1249,18 +1262,9 @@ static int DoDumpSynergies() {
         void* cls = GetObjClass(upgComps[0]);
         wchar_t clsName[128] = {}; if (cls) GetObjectName(cls, clsName, 128);
         Log("[Dump] UpgComp class=%ls @0x%llX\n", clsName[0] ? clsName : L"?", (uintptr_t)cls);
-        if (!CalibratePropLayout(cls, L"bComponentReady")) {
-            // Dump class header + the first two FField nodes so the true FField
-            // layout (where NamePrivate/Next sit) can be decoded offline.
+        // Two sentinels that must resolve to different offsets (bool vs int).
+        if (!CalibratePropLayout(cls, L"bComponentReady", L"DynamicBundleCount"))
             HexDumpToLog("UpgClass", cls, 0x90);
-            uintptr_t childHead = 0; FastRead64((uintptr_t)cls + 0x50, &childHead);
-            Log("[Dump]   ChildProperties(@0x50) head = 0x%llX\n", (uintptr_t)childHead);
-            if (childHead) {
-                HexDumpToLog("FField0", (void*)childHead, 0x50);
-                uintptr_t f2 = 0; // try Next at 0x20 to reach the 2nd node
-                if (FastRead64(childHead + 0x20, &f2) && f2) HexDumpToLog("FField0.next20", (void*)f2, 0x40);
-            }
-        }
     }
 
     // --- DECISIVE: live synergy state read by NAME via reflection offsets ---

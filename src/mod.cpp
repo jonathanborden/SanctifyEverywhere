@@ -1113,24 +1113,24 @@ static void HexDumpToLog(const char* tag, void* base, int len) {
     }
 }
 
-// UE 5.5 reflection (FField/UStruct) offsets — validated at runtime by resolving
-// a known bool (bComponentReady should read 0/1). Lets us get exact property byte
-// offsets BY NAME instead of guessing, and reused later to drive the injection.
-static const int USTRUCT_SUPER         = 0x40; // UStruct::SuperStruct
-static const int USTRUCT_CHILDPROPS    = 0x50; // UStruct::ChildProperties (FField*)
+// FField member layout is stable across UE5 (NamePrivate@0x28, Next@0x20,
+// Offset_Internal@0x4C). The UStruct fields that move between builds are
+// ChildProperties and SuperStruct — we CALIBRATE those at runtime by probing a
+// class with a known property, so a game update can't silently break the walk.
 static const int FFIELD_NEXT           = 0x20; // FField::Next
 static const int FFIELD_NAME           = 0x28; // FField::NamePrivate (FName)
 static const int FPROP_OFFSET_INTERNAL = 0x4C; // FProperty::Offset_Internal (int32)
+static int gUStructChildProps = -1; // calibrated UStruct::ChildProperties
+static int gUStructSuper       = -1; // calibrated UStruct::SuperStruct
 
-// Walk a UClass/UScriptStruct's FProperty chain (+ SuperStruct) for `propName`;
-// return its byte offset within an instance, or -1 if not found. classObj is
-// typically GetObjClass(instance). Read-only, SEH-guarded via Fast* reads.
-static int GetPropOffset(void* classObj, const wchar_t* propName) {
+// Walk one class's FProperty chain (+ supers) using given layout offsets; return
+// the byte offset of `propName`, or -1. Used both by calibration and resolution.
+static int WalkPropsLayout(void* classObj, int childOff, int superOff, const wchar_t* propName) {
     wchar_t nb[256];
     uintptr_t st = (uintptr_t)classObj;
-    for (int depth = 0; st && depth < 16; depth++) {
+    for (int depth = 0; st && depth < 24; depth++) {
         uintptr_t field = 0;
-        if (!FastRead64(st + USTRUCT_CHILDPROPS, &field)) break;
+        if (!FastRead64(st + childOff, &field)) break;
         for (int guard = 0; field && guard < 8192; guard++) {
             FName n{};
             if (FastRead32(field + FFIELD_NAME, &n.ComparisonIndex)
@@ -1141,9 +1141,37 @@ static int GetPropOffset(void* classObj, const wchar_t* propName) {
             }
             if (!FastRead64(field + FFIELD_NEXT, &field)) break;
         }
-        if (!FastRead64(st + USTRUCT_SUPER, &st)) break;
+        if (!FastRead64(st + superOff, &st)) break;
     }
     return -1;
+}
+
+// Find UStruct::ChildProperties / SuperStruct offsets by brute force: try each
+// combo and accept the first where `sentinelClass` resolves `sentinelProp`.
+static bool CalibratePropLayout(void* sentinelClass, const wchar_t* sentinelProp) {
+    if (gUStructChildProps >= 0) return true;
+    const int childCands[] = { 0x50, 0x48, 0x58, 0x40, 0x60, 0x68, 0x70 };
+    const int superCands[] = { 0x40, 0x48, 0x30, 0x38, 0x50 };
+    for (int ci = 0; ci < (int)(sizeof(childCands)/sizeof(int)); ci++)
+        for (int si = 0; si < (int)(sizeof(superCands)/sizeof(int)); si++) {
+            if (childCands[ci] == superCands[si]) continue;
+            int off = WalkPropsLayout(sentinelClass, childCands[ci], superCands[si], sentinelProp);
+            if (off >= 0 && off < 0x4000) {
+                gUStructChildProps = childCands[ci];
+                gUStructSuper = superCands[si];
+                Log("[Dump] reflection CALIBRATED: ChildProperties@0x%X SuperStruct@0x%X "
+                    "(%ls resolved to +0x%X)\n", gUStructChildProps, gUStructSuper, sentinelProp, off);
+                return true;
+            }
+        }
+    Log("[Dump] reflection calibration FAILED for sentinel %ls — dumping class layout\n", sentinelProp);
+    return false;
+}
+
+// Resolve a property's byte offset by name using calibrated layout. -1 if unknown.
+static int GetPropOffset(void* classObj, const wchar_t* propName) {
+    if (gUStructChildProps < 0) return -1;
+    return WalkPropsLayout(classObj, gUStructChildProps, gUStructSuper, propName);
 }
 
 // Read a TArray/TMap (FScriptArray/FScriptMap both start with {void* Data; int32
@@ -1164,6 +1192,7 @@ static int DoDumpSynergies() {
     void* playerStates[16]; int nPS = 0;
     void* lootSel[8]; int nLoot = 0;
     int nSynListView = 0, nActiveSynList = 0; // synergy-UI widget instances
+    void* synView = nullptr; // first WBP_SynergyListView_C instance
     int synTotal = 0;
     wchar_t zoneWorlds[8][96]; int nZoneWorlds = 0; // World instances naming a zone
 
@@ -1189,7 +1218,7 @@ static int DoDumpSynergies() {
         // property walk climbs SuperStruct so r_SynergyIds still resolves.
         else if (wcsstr(cb, L"PlayerState") && !wcsstr(cb, L"Base") && nPS < 16) playerStates[nPS++] = o;
         else if (wcscmp(cb, L"WBP_LootSelection_C") == 0 && nLoot < 8) lootSel[nLoot++] = o;
-        else if (wcscmp(cb, L"WBP_SynergyListView_C") == 0) nSynListView++;
+        else if (wcscmp(cb, L"WBP_SynergyListView_C") == 0) { nSynListView++; if (!synView) synView = o; }
         else if (wcscmp(cb, L"WBP_ActiveSynergyList_C") == 0) nActiveSynList++;
     }
 
@@ -1199,6 +1228,26 @@ static int DoDumpSynergies() {
     Log("[Dump] instances: UpgradeComponent=%d PlayerState=%d LootSelection=%d "
         "SynergyListView=%d ActiveSynergyList=%d\n",
         nUpg, nPS, nLoot, nSynListView, nActiveSynList);
+
+    // Calibrate the reflection layout against the upgrade component's known
+    // bComponentReady bool before reading anything by name.
+    if (nUpg > 0) {
+        void* cls = GetObjClass(upgComps[0]);
+        wchar_t clsName[128] = {}; if (cls) GetObjectName(cls, clsName, 128);
+        Log("[Dump] UpgComp class=%ls @0x%llX\n", clsName[0] ? clsName : L"?", (uintptr_t)cls);
+        if (!CalibratePropLayout(cls, L"bComponentReady")) {
+            // Dump class header + first-field candidates so the layout can be read offline.
+            HexDumpToLog("UpgClass", cls, 0x90);
+            for (int co = 0x40; co <= 0x70; co += 8) {
+                uintptr_t fp = 0; if (!FastRead64((uintptr_t)cls + co, &fp) || !fp) continue;
+                wchar_t fn[128] = {}; FName n{};
+                if (FastRead32(fp + FFIELD_NAME, &n.ComparisonIndex)
+                    && FastRead32(fp + FFIELD_NAME + 4, &n.Number)) GetFNameStr(&n, fn, 128);
+                Log("[Dump]   childCand @0x%X -> field 0x%llX name=%ls\n",
+                    co, (uintptr_t)fp, fn[0] ? fn : L"(unresolved)");
+            }
+        }
+    }
 
     // --- DECISIVE: live synergy state read by NAME via reflection offsets ---
     // SynergyAssetMap.Num == 0 in zones 1-2 and > 0 in zones 3-4 would prove the
@@ -1243,6 +1292,14 @@ static int DoDumpSynergies() {
         int32_t v = -1; if (off >= 0) FastRead32((uintptr_t)w + off, &v);
         Log("[Dump] LootSelection #%d @0x%llX bUsesSynergies@0x%X = %d\n",
             l, (uintptr_t)w, off, v & 0xFF);
+    }
+
+    // SynergyListView: ActiveSynergyIds is the array the UI shows (ArrayProperty);
+    // these widgets exist in all zones — the question is whether they're fed.
+    if (synView) {
+        int off = GetPropOffset(GetObjClass(synView), L"ActiveSynergyIds");
+        Log("[Dump] SynergyListView @0x%llX ActiveSynergyIds@0x%X Num=%d\n",
+            (uintptr_t)synView, off, ReadContainerNum(synView, off));
     }
 
     Log("===== END SYNERGY DUMP =====\n");

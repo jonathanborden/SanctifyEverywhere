@@ -1394,6 +1394,68 @@ static int DoDumpSynergies() {
 }
 
 // ============================================================
+// DIAGNOSTIC: co-op sanctify state dump (READ-ONLY)
+// ------------------------------------------------------------
+// On a listen-server host this lists the host's own ValPlayerSanctifyComponent
+// plus the replicated proxies of each connected client, so a co-op test log
+// shows: (a) how many sanctify components exist and which actor owns each,
+// (b) the +0x13A unlock bool on every one — whether our "set on all" stuck and
+// whether server->client replication later reverts it, (c) GameState +0x592,
+// and (d) whether the GameMode / SafeRoom EncounterManager are present (clients
+// have no GameMode actor, so anvil registration legitimately differs there).
+// Called on a ~5s timer in every zone, incl. Zone 4 where the native forge works
+// — that log is the reference for what a working co-op forge looks like in
+// memory. Nothing here writes game memory.
+// ============================================================
+static int DoDumpSanctify() {
+    SafeRead32((uintptr_t)gObjArrayBase + 0x14, &gNumElements);
+    SafeRead32((uintptr_t)gObjArrayBase + 0x1C, &gNumChunks);
+
+    void* comps[16]; int nComp = 0;
+    void* gsInst = nullptr, *gmInst = nullptr, *srmInst = nullptr;
+    int nPlayerState = 0, nPlayerController = 0;
+    wchar_t nb[256], cb[256];
+
+    for (int i = 0; i < gNumElements; i++) {
+        if ((i & 0x3FFF) == 0 && ScanAbort()) return 0;
+        void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
+        void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
+
+        if (wcsstr(cb, L"ValPlayerSanctifyComponent")) {
+            if (!GetObjectName(o, nb, 256) || wcsstr(nb, L"GEN_VARIABLE")) continue;
+            if (nComp < 16) comps[nComp++] = o;
+        }
+        else if (!gsInst && wcsstr(cb, L"GameState") && wcsstr(cb, L"RogueLite")) gsInst = o;
+        else if (!gmInst && wcsstr(cb, L"GameMode") && (wcsstr(cb, L"Dungeon") || wcsstr(cb, L"RogueLite"))) gmInst = o;
+        else if (!srmInst && wcsstr(cb, L"EncounterManager") && wcsstr(cb, L"SafeRoom")) srmInst = o;
+        else if (wcsstr(cb, L"PlayerState") && !wcsstr(cb, L"Base")) nPlayerState++;
+        else if (wcsstr(cb, L"PlayerController")) nPlayerController++;
+    }
+
+    int32_t gsBool = -1;
+    if (gsInst) SafeRead32((uintptr_t)gsInst + GAMESTATE_SANCTIFY_BOOL_OFFSET, &gsBool);
+
+    Log("[CoOp] === SANCTIFY DUMP: %d sanctifyComps, %d PlayerStates, %d PlayerControllers; "
+        "GameState=%s (+0x%X bool=%d) GameMode=%s SafeRoom=%s ===\n",
+        nComp, nPlayerState, nPlayerController,
+        gsInst ? "OK" : "NO", GAMESTATE_SANCTIFY_BOOL_OFFSET, gsInst ? (gsBool & 0xFF) : -1,
+        gmInst ? "OK" : "NO", srmInst ? "OK" : "NO");
+
+    for (int u = 0; u < nComp; u++) {
+        void* comp = comps[u];
+        int32_t b = -1; SafeRead32((uintptr_t)comp + PLAYER_SANCTIFY_BOOL_OFFSET, &b);
+        void* ou = GetObjOuter(comp); // owning actor: PlayerState / Pawn / Controller
+        wchar_t on[128] = {}, oc[128] = {};
+        if (ou) { GetObjectName(ou, on, 128); void* occ = GetObjClass(ou); if (occ) GetObjectName(occ, oc, 128); }
+        GetObjectName(comp, nb, 256);
+        Log("[CoOp]   comp #%d 0x%llX %ls  +0x%X bool=%d  owner=%ls(%ls)\n",
+            u, (uintptr_t)comp, nb, PLAYER_SANCTIFY_BOOL_OFFSET, b & 0xFF,
+            on[0] ? on : L"?", oc[0] ? oc : L"?");
+    }
+    return 1;
+}
+
+// ============================================================
 // Main thread
 // ============================================================
 
@@ -1479,7 +1541,7 @@ idle:
             static DWORD autoNoWorldSince = 0;
             static DWORD autoLastNoWorldDump = 0;
             static bool  autoIdleLogged = false;
-            static bool  autoDumpDone = false; // synergy diagnostic, once per world
+            static DWORD autoNextSanctifyDump = 0; // co-op sanctify diagnostic throttle
 
             DWORD now = GetTickCount();
             if ((int)(now - autoNextScan) >= 0) {
@@ -1511,7 +1573,7 @@ idle:
                     autoAttempts = 0;
                     autoFirstSeen = now;
                     autoIdleLogged = false;
-                    autoDumpDone = false;
+                    autoNextSanctifyDump = 0;
                     if (w) {
                         autoNoWorldSince = 0;
                         wchar_t wn[256] = {}, on[256] = {};
@@ -1524,12 +1586,16 @@ idle:
                     }
                 }
 
-                // SYNERGY DIAGNOSTIC: dump once per world in EVERY zone (incl. zone
-                // 3/4 reference). Read-only; compiled out unless logging is enabled.
+                // CO-OP SANCTIFY DIAGNOSTIC: dump sanctify component bool states on a
+                // ~5s timer in EVERY zone (incl. the Zone-4 native-forge reference) so
+                // we can watch whether the host's set-all sticks and whether
+                // replication reverts it. Read-only; compiled out unless logging is on.
+                // (The synergy dump, DoDumpSynergies(), is paused for this co-op build.)
 #if SANCTIFY_LOGGING
-                if (autoWorld && !autoDumpDone && (int)(now - autoFirstSeen) >= 3000) {
-                    autoDumpDone = true;
-                    DoDumpSynergies();
+                if (autoWorld && (int)(now - autoFirstSeen) >= 3000
+                    && (int)(now - autoNextSanctifyDump) >= 0) {
+                    DoDumpSanctify();
+                    autoNextSanctifyDump = now + 5000;
                 }
 #endif
 

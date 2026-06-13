@@ -128,29 +128,32 @@ static struct {
 // ============================================================
 
 static struct {
-    void* container;             // live WBP_Game_Currencies_C
+    void* containers[16];        // ALL live WBP_Game_Currencies_C instances
+    int   containerCount;
     void* addCurrencyWidgetFunc; // AddCurrencyWidget on WBP_Game_Currencies_C
     uintptr_t processEventAddr;
     uint8_t currencyId[16];
     volatile bool done;
-    volatile bool success;
+    volatile int  successCount;
 } gAddReq = {};
 
 static void GameThreadAddCurrency() {
     ProcessEvent_fn pe = (ProcessEvent_fn)gAddReq.processEventAddr;
-    __declspec(align(16)) uint8_t p[256] = {};
-    memcpy(p, gAddReq.currencyId, 16); // FPrimaryAssetId at param offset 0
-    __try {
-        pe(gAddReq.container, gAddReq.addCurrencyWidgetFunc, p);
-        Log("[GT-Add] AddCurrencyWidget OK on container 0x%llX; param buf after call: "
-            "%02X%02X%02X%02X %02X%02X%02X%02X | +16 0x%llX | +24 0x%llX | +32 0x%llX | +40 0x%llX\n",
-            (uintptr_t)gAddReq.container,
-            p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
-            *(uintptr_t*)(p + 16), *(uintptr_t*)(p + 24),
-            *(uintptr_t*)(p + 32), *(uintptr_t*)(p + 40));
-        gAddReq.success = true;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("[GT-Add] AddCurrencyWidget CRASHED\n");
+    gAddReq.successCount = 0;
+    // Add the vial to EVERY live currency container (visor HUD, tab/run menu,
+    // forge, upgrade screens). Adding to a single "best guess" container made the
+    // vial appear in only one of those views, flip-flopping per checkpoint load.
+    for (int i = 0; i < gAddReq.containerCount; i++) {
+        void* container = gAddReq.containers[i];
+        __declspec(align(16)) uint8_t p[256] = {};
+        memcpy(p, gAddReq.currencyId, 16); // FPrimaryAssetId at param offset 0
+        __try {
+            pe(container, gAddReq.addCurrencyWidgetFunc, p);
+            Log("[GT-Add] AddCurrencyWidget OK on container 0x%llX\n", (uintptr_t)container);
+            gAddReq.successCount++;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            Log("[GT-Add] AddCurrencyWidget CRASHED on container 0x%llX\n", (uintptr_t)container);
+        }
     }
     gAddReq.done = true;
 }
@@ -694,12 +697,19 @@ static void* FindCurrentWorld(bool verbose = false) {
         if (IsCDO(o)) continue;
         worldCount++;
         if (!GetObjectName(o, nb, 256)) continue;
-        // Real gameplay maps are RogueLite_ZoneN_MissionMM_P. The starting/colony
-        // ship (RogueLite_SubLevel_StartingShip_*, one per zone incl. _Apophis for
-        // the Zone-4 DLC), the home-base Lounge, and other hub/social areas are all
-        // RogueLite_SubLevel_* — the game's native forge already serves those, so we
-        // must never spawn an (out-of-bounds) anvil on a SubLevel world.
-        bool match = (wcsstr(nb, L"RogueLite") || wcsstr(nb, L"Mission")) && !wcsstr(nb, L"SubLevel");
+        // Real gameplay maps are RogueLite_ZoneN_..._P (always carry "Zone" and/or
+        // "Mission"). Exclude:
+        //   - the between-runs hub/colony ship, which is the bare RogueLite_P (no
+        //     Zone/Mission) and the RogueLite_SubLevel_StartingShip_* sublevels
+        //     (one per zone, incl. _Apophis for the Zone-4 DLC),
+        //   - the home-base Lounge and other RogueLite_SubLevel_* hub/social areas,
+        //   - non-RogueLite worlds like DungeonMapZonesAudio (has "Zones" but isn't
+        //     gameplay) and MainMenu_P.
+        // The game's native forge already serves the hub/ship, so spawning there put
+        // an out-of-bounds anvil on the starter ship.
+        bool match = wcsstr(nb, L"RogueLite")
+            && (wcsstr(nb, L"Zone") || wcsstr(nb, L"Mission"))
+            && !wcsstr(nb, L"SubLevel");
         if (verbose && worldCount <= 16) {
             void* ou = GetObjOuter(o);
             ob[0] = 0; if (ou) GetObjectName(ou, ob, 256);
@@ -721,15 +731,33 @@ static void* FindCurrentWorld(bool verbose = false) {
 static int gCurrencyIdOffset = 0;
 
 // One pass over live WBP_Game_Currency_C instances. Derives gCurrencyIdOffset,
-// reports whether a SanctityToken widget already exists, and identifies the
-// LIVE currencies container — the WBP_Game_Currencies_C that actually owns the
-// existing Scrap/Tech widgets (there can be more than one container instance;
-// adding to a non-displayed one silently does nothing).
+// reports whether a SanctityToken widget already exists, and collects ALL LIVE
+// currencies containers. There are several WBP_Game_Currencies_C instances at
+// once (visor HUD, tab/run menu, forge, upgrade screens); the native Scrap/Tech
+// currencies show in each, so the vial must be added to each. Adding to only one
+// made the vial flip between the HUD and the tab menu per checkpoint load.
 struct CurrencyScanResult {
-    int   widgetCount;     // live currency widget instances found
-    bool  sanctityPresent; // a widget already shows SanctityToken
-    void* liveContainer;   // container owning the most existing widgets
+    int   widgetCount;        // live currency widget instances found
+    bool  sanctityPresent;    // a widget already shows SanctityToken
+    void* liveContainers[16]; // every live currency container
+    int   liveCount;
 };
+
+// A WBP_Game_Currencies_C is LIVE (actually mounted on a player-facing UI) when
+// its outer chain reaches the running game instance/engine. Template/CDO
+// containers instead chain up to a /Game/...(Package); AddCurrencyWidget on those
+// shows nothing.
+static bool IsLiveContainer(void* container) {
+    wchar_t nb[128];
+    void* ou = container;
+    for (int d = 0; d < 10 && ou; d++) {
+        ou = GetObjOuter(ou); if (!ou) break;
+        if (GetObjectName(ou, nb, 128)
+            && (wcsstr(nb, L"ValGameEngine") || wcsstr(nb, L"BP_ValGameInstance")))
+            return true;
+    }
+    return false;
+}
 
 // Format an object's outer chain as "Name(Class) <- Name(Class) <- ..." for logs.
 static void FormatOuterChain(void* o, wchar_t* out, int outsz, int depth) {
@@ -747,18 +775,18 @@ static void FormatOuterChain(void* o, wchar_t* out, int outsz, int depth) {
 }
 
 static void ScanCurrencyWidgets(CurrencyScanResult* r, bool verbose) {
-    r->widgetCount = 0; r->sanctityPresent = false; r->liveContainer = nullptr;
+    r->widgetCount = 0; r->sanctityPresent = false; r->liveCount = 0;
     wchar_t cb[256], ns[256], ts[256], oc[512];
 
     // Pass 1: collect widget + container instances.
     void* widgets[64]; int nw = 0;
-    void* containers[8]; int ncont = 0;
+    void* containers[16]; int ncont = 0;
     for (int i = 0; i < gNumElements; i++) {
         if ((i & 0x3FFF) == 0 && ScanAbort()) return;
         void* o = GetUObject(i); if (!o || IsCDO(o)) continue;
         void* c = GetObjClass(o); if (!c || !GetObjectName(c, cb, 256)) continue;
         if (wcscmp(cb, L"WBP_Game_Currency_C") == 0) { if (nw < 64) widgets[nw++] = o; }
-        else if (wcscmp(cb, L"WBP_Game_Currencies_C") == 0) { if (ncont < 8) containers[ncont++] = o; }
+        else if (wcscmp(cb, L"WBP_Game_Currencies_C") == 0) { if (ncont < 16) containers[ncont++] = o; }
     }
     r->widgetCount = nw;
 
@@ -781,59 +809,44 @@ static void ScanCurrencyWidgets(CurrencyScanResult* r, bool verbose) {
         }
     }
 
-    // Pass 2: per widget — id, live on-screen count (id offset + 0x14, the
-    // confirmed display int), sanctity present, and track the widget with the
-    // highest count: that one is provably on the LIVE HUD (templates show 0).
-    void* liveWidget = nullptr; int liveCount = -1;
+    // Pass 2: per widget — only need to know whether a SanctityToken vial widget
+    // already exists anywhere (so we don't add it twice).
     for (int w = 0; w < nw; w++) {
         void* o = widgets[w];
         ns[0] = 0;
-        int32_t cnt = 0;
         if (gCurrencyIdOffset) {
             FName n;
             if (FastRead32((uintptr_t)o + gCurrencyIdOffset + 8, &n.ComparisonIndex)
                 && FastRead32((uintptr_t)o + gCurrencyIdOffset + 12, &n.Number))
                 GetFNameStr(&n, ns, 256);
-            FastRead32((uintptr_t)o + gCurrencyIdOffset + 0x14, &cnt);
             if (wcsstr(ns, L"SanctityToken")) r->sanctityPresent = true;
         }
-        if (cnt > liveCount) { liveCount = cnt; liveWidget = o; }
         if (verbose) {
             FormatOuterChain(o, oc, 512, 4);
-            Log("[Vials] widget 0x%llX id=%ls count=%d outers: %ls\n",
-                (uintptr_t)o, ns[0] ? ns : L"?", cnt, oc);
+            Log("[Vials] widget 0x%llX id=%ls outers: %ls\n",
+                (uintptr_t)o, ns[0] ? ns : L"?", oc);
         }
     }
 
-    // The live container is the one sharing an outer ancestor (the visor /
-    // HUD root) with the live widget. Widgets are NOT outered to their
-    // container, so ownership can only be inferred via a common ancestor.
-    void* anc[8] = {}; int na = 0;
-    void* ou = liveWidget;
-    for (int d = 0; d < 8 && ou; d++) { ou = GetObjOuter(ou); if (ou) anc[na++] = ou; }
-    for (int ci = 0; ci < ncont && !r->liveContainer; ci++) {
-        void* cu = containers[ci];
-        for (int d = 0; d < 8 && cu; d++) {
-            cu = GetObjOuter(cu);
-            for (int a = 0; a < na; a++)
-                if (cu && cu == anc[a]) { r->liveContainer = containers[ci]; break; }
-            if (r->liveContainer) break;
-        }
-    }
-    if (verbose) {
-        for (int ci = 0; ci < ncont; ci++) {
+    // Collect EVERY live container (outer chain reaches the game instance/engine).
+    // The vial gets added to all of them so it shows on the HUD AND the tab menu
+    // AND the forge/upgrade screens — wherever Scrap/Tech already appear.
+    for (int ci = 0; ci < ncont; ci++) {
+        bool live = IsLiveContainer(containers[ci]);
+        if (live && r->liveCount < 16) r->liveContainers[r->liveCount++] = containers[ci];
+        if (verbose) {
             wchar_t nb[128] = {};
             GetObjectName(containers[ci], nb, 128);
             FormatOuterChain(containers[ci], oc, 512, 4);
             Log("[Vials] container 0x%llX name=%ls%s outers: %ls\n",
-                (uintptr_t)containers[ci], nb,
-                containers[ci] == r->liveContainer ? L" [LIVE-MATCH]" : L"", oc);
+                (uintptr_t)containers[ci], nb, live ? L" [LIVE]" : L"", oc);
         }
-        Log("[Vials] liveWidget=0x%llX (count=%d) liveContainer=%s\n",
-            (uintptr_t)liveWidget, liveCount, r->liveContainer ? "matched" : "NO MATCH");
     }
-    // Fallback: no shared ancestor — use the first container so we at least try.
-    if (!r->liveContainer && ncont) r->liveContainer = containers[0];
+    if (verbose)
+        Log("[Vials] %d container instances, %d live\n", ncont, r->liveCount);
+    // Fallback: nothing matched the liveness test — try the first container so we
+    // at least attempt an add rather than silently doing nothing.
+    if (!r->liveCount && ncont) r->liveContainers[r->liveCount++] = containers[0];
 }
 
 // Spawn sanctified anvils at every fabricator. Returns 0 = not ready (retry later),
@@ -904,8 +917,8 @@ static int DoSpawnAnvils() {
         if (!anvilClass && (wcscmp(cb, L"BlueprintGeneratedClass") == 0 || wcscmp(cb, L"Class") == 0)
             && wcscmp(nb, L"BP_SanctifiedAnvil_C") == 0) anvilClass = o;
 
-        if (!world && wcscmp(cb, L"World") == 0
-            && (wcsstr(nb, L"RogueLite") || wcsstr(nb, L"Mission")) && !wcsstr(nb, L"SubLevel"))
+        if (!world && wcscmp(cb, L"World") == 0 && wcsstr(nb, L"RogueLite")
+            && (wcsstr(nb, L"Zone") || wcsstr(nb, L"Mission")) && !wcsstr(nb, L"SubLevel"))
             world = o;
 
         if (wcscmp(cb, L"BP_Fabricator_C") == 0 && fabCount < 32)
@@ -1007,14 +1020,14 @@ static int DoAddVials() {
     DWORD t0 = GetTickCount();
     CurrencyScanResult cs;
     ScanCurrencyWidgets(&cs, true);
-    Log("[Vials] widget scan %lums: %d currency widgets, sanctity=%s, liveContainer=%s\n",
+    Log("[Vials] widget scan %lums: %d currency widgets, sanctity=%s, liveContainers=%d\n",
         (unsigned long)(GetTickCount() - t0), cs.widgetCount,
-        cs.sanctityPresent ? "PRESENT" : "absent", cs.liveContainer ? "OK" : "NO");
+        cs.sanctityPresent ? "PRESENT" : "absent", cs.liveCount);
     if (cs.sanctityPresent) return 2;
 
     // No live currency widgets yet = the HUD hasn't been built. Adding now
     // would target a template/preload container and silently show nothing.
-    if (!cs.widgetCount || !cs.liveContainer) {
+    if (!cs.widgetCount || !cs.liveCount) {
         Log("[Vials] HUD not live yet (no existing currency widgets) — NOT READY, will retry\n");
         return 0;
     }
@@ -1069,20 +1082,21 @@ static int DoAddVials() {
         return 0;
     }
 
-    gAddReq.container = cs.liveContainer;
+    for (int i = 0; i < cs.liveCount; i++) gAddReq.containers[i] = cs.liveContainers[i];
+    gAddReq.containerCount = cs.liveCount;
     gAddReq.addCurrencyWidgetFunc = addCurrFunc;
     gAddReq.processEventAddr = gProcessEventAddr;
     memcpy(gAddReq.currencyId, currencyId, 16);
-    gAddReq.done = false; gAddReq.success = false;
+    gAddReq.done = false; gAddReq.successCount = 0;
 
     if (!TickHook::Install(0)) { Log("[Vials] tick hook install failed\n"); return 0; }
     DWORD gtT0 = GetTickCount();
     TickHook::QueueOnGameThread(GameThreadAddCurrency);
     int waited = 0;
     for (int w = 0; w < 100 && !gAddReq.done; w++) { Sleep(50); waited++; }
-    Log("[Vials] game-thread wait: %dms (done=%s success=%s)\n",
-        waited * 50, gAddReq.done?"Y":"N", gAddReq.success?"Y":"N");
-    if (!gAddReq.success) {
+    Log("[Vials] game-thread wait: %dms (done=%s added=%d/%d)\n",
+        waited * 50, gAddReq.done?"Y":"N", gAddReq.successCount, gAddReq.containerCount);
+    if (gAddReq.successCount == 0) {
         Log("[Vials] ADD FAILED (total %lums)\n", (unsigned long)(GetTickCount() - vialT0));
         return 0;
     }

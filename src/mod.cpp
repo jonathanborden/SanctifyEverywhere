@@ -110,7 +110,12 @@ static struct {
     void* enableSAFunc;
     void* safeRoomMgr;
     void* gameStateInst;
-    void* playerSanctifyComp;
+    // Co-op: one ValPlayerSanctifyComponent exists per player (local + replicated
+    // proxies). We must flip the unlock bool on ALL of them — setting only the
+    // first-found one (arbitrary GUObjectArray order) randomly left some players,
+    // including the host, unable to bless.
+    void* playerSanctifyComps[16];
+    int   playerSanctifyCompCount;
     uintptr_t processEventAddr;
     double spawnX[32], spawnY[32], spawnZ[32];
     int spawnCount;
@@ -291,11 +296,19 @@ static void GameThreadSpawn() {
         Log("[GT] GameState+0x%X set TRUE\n", GAMESTATE_SANCTIFY_BOOL_OFFSET);
     }
 
-    // Set player sanctify component bool using cached offset (instant)
-    if (gSpawnReq.playerSanctifyComp && IsSafeToRead(gSpawnReq.playerSanctifyComp, PLAYER_SANCTIFY_BOOL_OFFSET + 1)) {
-        ((uint8_t*)gSpawnReq.playerSanctifyComp)[PLAYER_SANCTIFY_BOOL_OFFSET] = 1;
-        Log("[GT] PlayerSanctifyComp+0x%X set TRUE\n", PLAYER_SANCTIFY_BOOL_OFFSET);
+    // Set the unlock bool on EVERY player sanctify component (co-op: one per
+    // player). Setting only the first one left blessing working for a random
+    // subset of players and often not the host.
+    int pscSet = 0;
+    for (int p = 0; p < gSpawnReq.playerSanctifyCompCount; p++) {
+        void* comp = gSpawnReq.playerSanctifyComps[p];
+        if (comp && IsSafeToRead(comp, PLAYER_SANCTIFY_BOOL_OFFSET + 1)) {
+            ((uint8_t*)comp)[PLAYER_SANCTIFY_BOOL_OFFSET] = 1;
+            pscSet++;
+        }
     }
+    if (pscSet) Log("[GT] PlayerSanctifyComp+0x%X set TRUE on %d component(s)\n",
+                    PLAYER_SANCTIFY_BOOL_OFFSET, pscSet);
 
     Log("[GT] *** %d ANVILS SPAWNED! ***\n", gSpawnReq.spawnCount);
     gSpawnReq.success = true;
@@ -681,7 +694,12 @@ static void* FindCurrentWorld(bool verbose = false) {
         if (IsCDO(o)) continue;
         worldCount++;
         if (!GetObjectName(o, nb, 256)) continue;
-        bool match = wcsstr(nb, L"RogueLite") || wcsstr(nb, L"Mission");
+        // Real gameplay maps are RogueLite_ZoneN_MissionMM_P. The starting/colony
+        // ship (RogueLite_SubLevel_StartingShip_*, one per zone incl. _Apophis for
+        // the Zone-4 DLC), the home-base Lounge, and other hub/social areas are all
+        // RogueLite_SubLevel_* — the game's native forge already serves those, so we
+        // must never spawn an (out-of-bounds) anvil on a SubLevel world.
+        bool match = (wcsstr(nb, L"RogueLite") || wcsstr(nb, L"Mission")) && !wcsstr(nb, L"SubLevel");
         if (verbose && worldCount <= 16) {
             void* ou = GetObjOuter(o);
             ob[0] = 0; if (ou) GetObjectName(ou, ob, 256);
@@ -833,7 +851,8 @@ static int DoSpawnAnvils() {
     void* freshBS = nullptr, *freshFS = nullptr, *freshSL = nullptr;
     void* freshCS = nullptr, *freshBP = nullptr, *freshCDO = nullptr;
     void* ssaFunc = nullptr, *esaFunc = nullptr;
-    void* gmInst = nullptr, *srmInst = nullptr, *gsInst = nullptr, *pscInst = nullptr;
+    void* gmInst = nullptr, *srmInst = nullptr, *gsInst = nullptr;
+    void* pscInstances[16] = {}; int pscCount = 0; // all player sanctify comps (co-op = one per player)
     void* fabInstances[32] = {}; int fabCount = 0;
     wchar_t nb[256], cb[256], ob[256];
 
@@ -885,7 +904,8 @@ static int DoSpawnAnvils() {
         if (!anvilClass && (wcscmp(cb, L"BlueprintGeneratedClass") == 0 || wcscmp(cb, L"Class") == 0)
             && wcscmp(nb, L"BP_SanctifiedAnvil_C") == 0) anvilClass = o;
 
-        if (!world && wcscmp(cb, L"World") == 0 && (wcsstr(nb, L"RogueLite") || wcsstr(nb, L"Mission")))
+        if (!world && wcscmp(cb, L"World") == 0
+            && (wcsstr(nb, L"RogueLite") || wcsstr(nb, L"Mission")) && !wcsstr(nb, L"SubLevel"))
             world = o;
 
         if (wcscmp(cb, L"BP_Fabricator_C") == 0 && fabCount < 32)
@@ -897,8 +917,9 @@ static int DoSpawnAnvils() {
             srmInst = o;
         if (!gsInst && wcsstr(cb, L"GameState") && wcsstr(cb, L"RogueLite"))
             gsInst = o;
-        if (!pscInst && wcsstr(cb, L"ValPlayerSanctifyComponent") && !wcsstr(nb, L"GEN_VARIABLE"))
-            pscInst = o;
+        if (wcsstr(cb, L"ValPlayerSanctifyComponent") && !wcsstr(nb, L"GEN_VARIABLE")
+            && pscCount < 16)
+            pscInstances[pscCount++] = o;
     }
 
     uintptr_t freshPE = 0;
@@ -909,12 +930,12 @@ static int DoSpawnAnvils() {
     }
 
     Log("[Spawn] scan done in %lums: Anvil=%s World=%s CDO=%s BS=%s FS=%s SL=%s CS=%s BP=%s PE=%s "
-        "SetSA=%s EnableSA=%s GM=%s SafeRoom=%s GS=%s PSC=%s Fabs=%d\n",
+        "SetSA=%s EnableSA=%s GM=%s SafeRoom=%s GS=%s PSC=%d Fabs=%d\n",
         (unsigned long)(GetTickCount() - spawnT0),
         anvilClass?"OK":"NO", world?"OK":"NO", freshCDO?"OK":"NO", freshBS?"OK":"NO", freshFS?"OK":"NO",
         freshSL?"OK":"NO", freshCS?"OK":"NO", freshBP?"OK":"NO", freshPE?"OK":"NO",
         ssaFunc?"OK":"NO", esaFunc?"OK":"NO", gmInst?"OK":"NO", srmInst?"OK":"NO",
-        gsInst?"OK":"NO", pscInst?"OK":"NO", fabCount);
+        gsInst?"OK":"NO", pscCount, fabCount);
 
     if (!anvilClass || !world || !freshBS || !freshFS || !freshCDO || !freshPE) {
         Log("[Spawn] missing critical objects — NOT READY, will retry\n");
@@ -953,7 +974,8 @@ static int DoSpawnAnvils() {
     gSpawnReq.enableSAFunc = esaFunc;
     gSpawnReq.safeRoomMgr = srmInst;
     gSpawnReq.gameStateInst = gsInst;
-    gSpawnReq.playerSanctifyComp = pscInst;
+    for (int p = 0; p < pscCount; p++) gSpawnReq.playerSanctifyComps[p] = pscInstances[p];
+    gSpawnReq.playerSanctifyCompCount = pscCount;
 
     Log("Spawning %d anvils...\n", sc);
     gSpawnReq.resultReady = false;

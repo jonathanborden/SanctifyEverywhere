@@ -1406,7 +1406,7 @@ static DWORD WINAPI ModThreadProc(LPVOID) {
     if (!gLogFile) return 0;
 #endif
 
-    Log("=== SanctifyEverywhere v1.1 [SYNERGY DIAGNOSTIC BUILD] ===\n");
+    Log("=== SanctifyEverywhere v1.2 ===\n");
     Log("Background thread ID: %lu\n", GetCurrentThreadId());
 
     HWND gw = nullptr;

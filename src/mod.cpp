@@ -849,9 +849,14 @@ static void ScanCurrencyWidgets(CurrencyScanResult* r, bool verbose) {
     if (!r->liveCount && ncont) r->liveContainers[r->liveCount++] = containers[0];
 }
 
-// Spawn sanctified anvils at every fabricator. Returns 0 = not ready (retry later),
-// 1 = attempted (do not retry — avoids duplicate anvils). Waits until fabricators
-// have loaded before spawning.
+// Spawn a sanctified anvil at every fabricator that doesn't already have one.
+// Idempotent: safe to call repeatedly within a world (skips fabricators already
+// covered), so the caller can keep calling it across a settle window to catch
+// fabricators that stream in late on a fast checkpoint reload. Returns:
+//   0 = not done — missing critical objects, or a fabricator is still loading
+//       its transform; the caller should retry.
+//   1 = nothing left to do this call (all fabricators covered / none pending).
+//  >1 = the count of new anvils placed this call.
 static int DoSpawnAnvils() {
     DWORD spawnT0 = GetTickCount();
     Log("=== SPAWN ANVILS === (gNumElements before refresh)\n");
@@ -867,6 +872,7 @@ static int DoSpawnAnvils() {
     void* gmInst = nullptr, *srmInst = nullptr, *gsInst = nullptr;
     void* pscInstances[16] = {}; int pscCount = 0; // all player sanctify comps (co-op = one per player)
     void* fabInstances[32] = {}; int fabCount = 0;
+    void* anvilInstances[64] = {}; int anvilInstCount = 0; // existing anvils, for idempotent re-spawn
     wchar_t nb[256], cb[256], ob[256];
 
     for (int i = 0; i < gNumElements; i++) {
@@ -924,6 +930,11 @@ static int DoSpawnAnvils() {
         if (wcscmp(cb, L"BP_Fabricator_C") == 0 && fabCount < 32)
             fabInstances[fabCount++] = o;
 
+        // Already-spawned anvils — used to skip fabricators we've already covered
+        // so repeated spawn passes within a world never stack duplicate anvils.
+        if (wcscmp(cb, L"BP_SanctifiedAnvil_C") == 0 && anvilInstCount < 64)
+            anvilInstances[anvilInstCount++] = o;
+
         if (!gmInst && wcsstr(cb, L"GameMode") && (wcsstr(cb, L"Dungeon") || wcsstr(cb, L"RogueLite")))
             gmInst = o;
         if (!srmInst && wcsstr(cb, L"EncounterManager") && wcsstr(cb, L"SafeRoom"))
@@ -955,22 +966,44 @@ static int DoSpawnAnvils() {
         return 0;
     }
 
-    int sc = 0;
-    for (int fi = 0; fi < fabCount && sc < 32; fi++) {
-        double fx, fy, fz;
-        if (GetActorLoc(fabInstances[fi], &fx, &fy, &fz)) {
-            gSpawnReq.spawnX[sc] = fx - 576.8;
-            gSpawnReq.spawnY[sc] = fy + 35.5;
-            gSpawnReq.spawnZ[sc] = fz - 123.1;
-            sc++;
+    // Resolve locations of anvils that already exist, so we can skip fabricators
+    // we've already placed one at (idempotent re-spawn).
+    double anvX[64], anvY[64], anvZ[64]; int anvLocCount = 0;
+    for (int ai = 0; ai < anvilInstCount && anvLocCount < 64; ai++) {
+        double ax, ay, az;
+        if (GetActorLoc(anvilInstances[ai], &ax, &ay, &az)) {
+            anvX[anvLocCount] = ax; anvY[anvLocCount] = ay; anvZ[anvLocCount] = az; anvLocCount++;
         }
     }
+
+    // Build spawn list from fabricators that (a) report a real transform and
+    // (b) don't already have an anvil at their target spot. A fabricator that
+    // streamed in but hasn't initialized its transform reads (0,0,0); GetActorLoc
+    // rejects that, so we count it as "not ready" and report retry — this is the
+    // safe-room fabricator that loads late on a fast checkpoint reload.
+    int sc = 0, covered = 0, notReady = 0;
+    for (int fi = 0; fi < fabCount && sc < 32; fi++) {
+        double fx, fy, fz;
+        if (!GetActorLoc(fabInstances[fi], &fx, &fy, &fz)) { notReady++; continue; }
+        double tx = fx - 576.8, ty = fy + 35.5, tz = fz - 123.1;
+        bool already = false;
+        for (int k = 0; k < anvLocCount; k++) {
+            double dx = anvX[k] - tx, dy = anvY[k] - ty, dz = anvZ[k] - tz;
+            if (dx*dx + dy*dy + dz*dz < 150.0*150.0) { already = true; break; }
+        }
+        if (already) { covered++; continue; }
+        gSpawnReq.spawnX[sc] = tx; gSpawnReq.spawnY[sc] = ty; gSpawnReq.spawnZ[sc] = tz; sc++;
+    }
     if (sc == 0) {
-        Log("[Spawn] %d fabricators found but 0 reachable locations — NOT READY, will retry\n", fabCount);
-        return 0;
+        // Nothing new to place. If a fabricator is still loading, the caller should
+        // keep retrying within its window; otherwise everything's covered.
+        Log("[Spawn] no new anvils: %d covered, %d not-ready, %d total fabs — %s\n",
+            covered, notReady, fabCount, notReady ? "will retry" : "all covered");
+        return notReady ? 0 : 1;
     }
     gSpawnReq.spawnCount = sc;
-    Log("[Spawn] resolved %d/%d fabricator locations\n", sc, fabCount);
+    Log("[Spawn] placing %d new anvil(s) (%d already covered, %d not-ready, %d total fabs)\n",
+        sc, covered, notReady, fabCount);
 
     gSpawnReq.bpAnvilClass = anvilClass;
     gSpawnReq.gameWorld = world;
@@ -1006,7 +1039,7 @@ static int DoSpawnAnvils() {
         (unsigned long)(GetTickCount() - spawnT0));
     else Log("[Spawn] may have failed (total %lums, game-thread %lums)\n",
         (unsigned long)(GetTickCount() - spawnT0), (unsigned long)(GetTickCount() - gtT0));
-    return 1;
+    return 1 + sc; // >1 = placed sc new anvils this call
 }
 
 // Add the SanctityToken vial widget to the live HUD. Returns 0 = not ready (retry),
@@ -1511,9 +1544,19 @@ idle:
                         Log("[Auto] --- attempt %d/20 (anvils=%d vials=%d) ---\n",
                             autoAttempts, autoAnvilsDone?1:0, autoVialsDone?1:0);
                         if (!autoAnvilsDone) {
-                            int r = DoSpawnAnvils(); // waits until fabricators have loaded
-                            if (r == 1) { autoAnvilsDone = true; Log("[Auto] anvils marked done\n"); }
-                            else Log("[Auto] anvils returned %d — will retry\n", r);
+                            int r = DoSpawnAnvils(); // idempotent; places at any newly-ready fabricator
+                            if (r > 1) Log("[Auto] placed %d new anvil(s)\n", r - 1);
+                            // Hold the spawn window open ~18s from first sight of the
+                            // world so a safe-room fabricator that streams in late
+                            // (reads (0,0,0) right after a fast checkpoint reload, or
+                            // whose actor appears a beat later) still gets an anvil.
+                            // DoSpawnAnvils skips fabricators already covered, so the
+                            // extra passes never stack duplicates and are scan-only
+                            // once everything's placed. Close the window after 18s.
+                            if ((int)(now - autoFirstSeen) >= 18000) {
+                                autoAnvilsDone = true;
+                                Log("[Auto] anvil spawn window closed — idling\n");
+                            }
                         }
                         if (!autoVialsDone) {
                             int r = DoAddVials();
